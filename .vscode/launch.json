@@ -1,0 +1,37 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Flask API (bulk worker)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/app.py",
+      "console": "integratedTerminal",
+      "env": {
+        "FLASK_ENV": "development",
+        "FLASK_DEBUG": "1"
+      },
+      "justMyCode": true
+    },
+    {
+      "name": "RQ Worker (bulk-pipeline)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "rq",
+      "args": [
+        "worker", "bulk-pipeline",
+        "--url", "redis://localhost:6379",
+        "--name", "local-bulk-worker",
+        "--with-scheduler"
+      ],
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Full Bulk Stack (Flask + Worker)",
+      "configurations": ["Flask API (bulk worker)", "RQ Worker (bulk-pipeline)"]
+    }
+  ]
+}

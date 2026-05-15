@@ -1,0 +1,13 @@
+flask==3.0.3
+flask-cors==4.0.1
+supabase==2.9.1
+openai==1.51.0
+redis==5.0.8
+rq==1.16.2
+apscheduler==3.10.4
+pdfminer.six==20231228
+pypdf==4.3.1
+python-docx==1.1.2
+requests==2.32.3
+python-dotenv==1.0.1
+tenacity==8.5.0
