@@ -7,8 +7,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'hrumbles-bulk-worker/**'
-      - '.github/workflows/deploy-bulk-worker.yml'
+      - '**'
   workflow_dispatch:   # allow manual trigger from GitHub Actions UI
 
 jobs:
@@ -49,8 +48,8 @@ jobs:
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
-          context: ./hrumbles-bulk-worker
-          file:    ./hrumbles-bulk-worker/Dockerfile
+          context: .
+          file:    ./Dockerfile
           push:    true
           tags:    ${{ steps.meta.outputs.tags }}
           labels:  ${{ steps.meta.outputs.labels }}
