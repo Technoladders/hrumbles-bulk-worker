@@ -503,6 +503,7 @@ def _ingest_one(row: Dict) -> str:
     org_id       = row['organization_id']
     profile      = row.get('extracted_profile') or {}
     storage_path = row.get('storage_path') or ''
+    resume_text  = row.get('resume_text') or ''
     now          = datetime.now(timezone.utc)
 
     email = (
@@ -547,7 +548,7 @@ def _ingest_one(row: Dict) -> str:
 
     if not existing.data:
         # ── INSERT new candidate ──────────────────────────────────────────────
-        data = _build_insert_payload(profile, email, resume_url, org_id)
+        data = _build_insert_payload(profile, email, resume_url, org_id, resume_text)
         ins  = supabase.table('hr_talent_pool').insert(data).execute()
         candidate_id = ins.data[0]['id'] if ins.data else None
         action       = 'INSERTED'
@@ -568,7 +569,7 @@ def _ingest_one(row: Dict) -> str:
 
         if age_days > 30:
             # ── Full update ───────────────────────────────────────────────────
-            data = _build_update_payload(profile, resume_url)
+            data = _build_update_payload(profile, resume_url, resume_text)
             supabase.table('hr_talent_pool').update(data).eq('id', candidate_id).execute()
             field_changes = list(data.keys())
             action        = 'UPDATED'
@@ -603,7 +604,7 @@ def _ingest_one(row: Dict) -> str:
     return action
 
 
-def _build_insert_payload(profile: Dict, email: str, resume_url: str, org_id: str) -> Dict:
+def _build_insert_payload(profile: Dict, email: str, resume_url: str, org_id: str, resume_text: str = '') -> Dict:
     name = _name(profile)
     payload = {
         'candidate_name':      name,
@@ -627,14 +628,15 @@ def _build_insert_payload(profile: Dict, email: str, resume_url: str, org_id: st
         'notice_period':       profile.get('notice_period'),
         'highest_education':   profile.get('highest_education'),
         'resume_path':         resume_url,
+        'resume_text':          resume_text,
         'source_platform':     'bulk_upload',
         'organization_id':     org_id,
     }
     # Strip None values (let DB defaults apply, avoid overwriting with NULL)
-    return {k: v for k, v in payload.items() if v is not None}
+    return {k: v for k, v in payload.items() if k == 'resume_text' or v is not None}
 
 
-def _build_update_payload(profile: Dict, resume_url: str) -> Dict:
+def _build_update_payload(profile: Dict, resume_url: str, resume_text: str = '') -> Dict:
     name = _name(profile)
     payload = {
         'candidate_name':      name,
@@ -657,8 +659,9 @@ def _build_update_payload(profile: Dict, resume_url: str) -> Dict:
         'notice_period':       profile.get('notice_period'),
         'highest_education':   profile.get('highest_education'),
         'resume_path':         resume_url,
+        'resume_text':          resume_text,
     }
-    return {k: v for k, v in payload.items() if v is not None}
+    return {k: v for k, v in payload.items() if k == 'resume_text' or v is not None}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
