@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpoppler-cpp-dev \
     poppler-utils \
+    antiword \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
