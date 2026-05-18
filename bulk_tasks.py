@@ -528,12 +528,18 @@ def _ingest_one(row: Dict) -> str:
         return 'SKIPPED_NO_EMAIL'
 
     # ── Lookup existing candidate ─────────────────────────────────────────────
-    existing = supabase.table('hr_talent_pool') \
+    _res = supabase.table('hr_talent_pool') \
         .select('id, updated_at, resume_text, resume_path') \
         .eq('organization_id', org_id) \
         .ilike('email', email) \
-        .maybe_single() \
+        .limit(1) \
         .execute()
+        
+    existing = type(
+        'obj',
+        (object,),
+        {'data': _res.data[0] if _res.data else None}
+    )
 
     action       = 'UNKNOWN'
     candidate_id = None

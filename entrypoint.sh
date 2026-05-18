@@ -25,6 +25,7 @@ try:
     print('    Stuck files reset OK')
 except Exception as e:
     print(f'    Warning: could not reset stuck files: {e}')
+    print('    Continuing startup...')
 "
 
 # Start RQ worker in background (bulk-pipeline queue only)
