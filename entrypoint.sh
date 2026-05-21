@@ -8,7 +8,6 @@ echo "========================================="
 REDIS_URL="redis://${REDIS_HOST:-redis}:${REDIS_PORT:-6379}"
 echo ">>> Redis URL: $REDIS_URL"
 
-# Wait for Redis to be ready
 echo ">>> Waiting for Redis..."
 until python -c "import redis; redis.Redis(host='${REDIS_HOST:-redis}', port=${REDIS_PORT:-6379}).ping()" 2>/dev/null; do
   echo "    Redis not ready, retrying in 2s..."
@@ -16,7 +15,6 @@ until python -c "import redis; redis.Redis(host='${REDIS_HOST:-redis}', port=${R
 done
 echo ">>> Redis is ready"
 
-# Reset any stuck files from previous crash
 echo ">>> Resetting stuck files from previous run..."
 python -c "
 from config import supabase
@@ -25,28 +23,32 @@ try:
     print('    Stuck files reset OK')
 except Exception as e:
     print(f'    Warning: could not reset stuck files: {e}')
-    print('    Continuing startup...')
 "
 
-# Start RQ worker in background (bulk-pipeline queue only)
-echo ">>> Starting RQ worker (bulk-pipeline queue)..."
-rq worker bulk-pipeline \
-  --url "$REDIS_URL" \
-  --name "bulk-worker-$(hostname)" \
-  --max-jobs 1000 \
-  &
-RQ_PID=$!
-echo ">>> RQ worker started (PID: $RQ_PID)"
+# ── Watchdog: restarts RQ worker whenever it exits ──────────────────────────
+echo ">>> Starting RQ worker watchdog..."
+(
+  while true; do
+    echo ">>> [Watchdog] Starting RQ worker..."
+    rq worker bulk-pipeline \
+      --url "$REDIS_URL" \
+      --name "bulk-worker-$(hostname)" \
+      --max-jobs 200 \
+      2>&1
+    EXIT_CODE=$?
+    echo ">>> [Watchdog] RQ worker exited (code: $EXIT_CODE). Restarting in 5s..."
+    sleep 5
+  done
+) &
+WATCHDOG_PID=$!
+echo ">>> Watchdog started (PID: $WATCHDOG_PID)"
 
-# Small delay before Flask starts
-sleep 1
+sleep 2
 
-# Start Flask (with embedded APScheduler)
 echo ">>> Starting Flask API on port ${PORT:-5010}..."
 python app.py
 
-# If Flask exits (shouldn't happen), kill RQ worker
-echo ">>> Flask exited, shutting down RQ worker..."
-kill $RQ_PID 2>/dev/null || true
-wait $RQ_PID 2>/dev/null || true
+echo ">>> Flask exited, killing watchdog..."
+kill $WATCHDOG_PID 2>/dev/null || true
+wait $WATCHDOG_PID 2>/dev/null || true
 echo ">>> Shutdown complete"
