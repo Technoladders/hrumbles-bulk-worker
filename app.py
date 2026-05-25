@@ -46,6 +46,12 @@ def _on_error(event):
 def _on_missed(event):
     logger.warning(f'[Scheduler] Job missed: {event.job_id}')
 
+def _reset_stuck():
+    try:
+        supabase.rpc('reset_stuck_bulk_files', {}).execute()
+        logger.info('[Scheduler] reset_stuck_bulk_files OK')
+    except Exception as e:
+        logger.error(f'[Scheduler] reset_stuck_bulk_files failed: {e}')
 
 scheduler = BackgroundScheduler(timezone='UTC')
 scheduler.add_listener(_on_error,  EVENT_JOB_ERROR)
@@ -55,6 +61,16 @@ scheduler.add_job(lambda: _enqueue('parse_resume_batch',      300), 'interval', 
 scheduler.add_job(lambda: _enqueue('submit_ai_batch',         600), 'interval', minutes=5,   id='submit',  max_instances=1, coalesce=True, misfire_grace_time=60)
 scheduler.add_job(lambda: _enqueue('poll_ai_batches',         600), 'interval', minutes=10,  id='poll',    max_instances=1, coalesce=True, misfire_grace_time=60)
 scheduler.add_job(lambda: _enqueue('ingest_candidates_batch', 600), 'interval', seconds=30,  id='ingest',  max_instances=1, coalesce=True, misfire_grace_time=15)
+
+scheduler.add_job(
+    _reset_stuck,
+    'interval',
+    minutes=15,
+    id='reset_stuck',
+    max_instances=1,
+    coalesce=True,
+    misfire_grace_time=60
+)
 
 scheduler.start()
 logger.info('[Scheduler] Started: parse/15s, submit/5m, poll/10m, ingest/30s')

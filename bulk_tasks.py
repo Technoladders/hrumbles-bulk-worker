@@ -178,7 +178,7 @@ def _submit_org_batch(org_id: str, files: List[Dict]) -> int:
             lines.append(json.dumps({
                 'custom_id': cid, 'method': 'POST', 'url': '/v1/chat/completions',
                 'body': {
-                    'model': 'gpt-4.1-nano',
+                    'model': 'gpt-5-nano',
                     'response_format': {'type': 'json_object'},
                     'messages': [
                         {'role': 'system', 'content': SYSTEM_PROMPT},
