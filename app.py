@@ -48,7 +48,7 @@ def _on_missed(event):
 
 def _reset_stuck():
     try:
-        supabase.rpc('reset_stuck_bulk_files', {}).execute()
+        supabase.rpc('force_reset_stuck_bulk_files', {}).execute()
         logger.info('[Scheduler] reset_stuck_bulk_files OK')
     except Exception as e:
         logger.error(f'[Scheduler] reset_stuck_bulk_files failed: {e}')
