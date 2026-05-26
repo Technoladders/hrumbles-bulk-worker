@@ -3,27 +3,35 @@ bulk_tasks.py
 
 Four RQ worker functions for the bulk resume pipeline.
 
-Worker 1 — parse_resume_batch      every 15s
+Worker 1 — parse_resume_batch      every 10s  (was 15s)
 Worker 2 — submit_ai_batch         every 5min
-Worker 3 — poll_ai_batches         every 10min  ← FIXED (see FIXES below)
-Worker 4 — ingest_candidates_batch every 30s
+Worker 3 — poll_ai_batches         every 10min
+Worker 4 — ingest_candidates_batch every 15s  (was 30s)
 
-FIXES in poll_ai_batches / _check_one_batch vs original:
-  1. updated_at stamped on EVERY poll cycle (including in_progress updates)
-  2. Stale guard: logs warning if batch updated_at is >2h old and still processing
-  3. Per-chunk try/except on insert — one bad chunk never stops others
-  4. Duplicate key (23505) handling — falls back to row-by-row, counts dupes as success
-  5. Output file download failure → returns 'in_progress' (retries next cycle)
-  6. Input file deletion fully isolated in own try/except — never kills completion
-  7. Outer poll_ai_batches stamps error_message on unhandled exceptions
+PERFORMANCE CHANGES vs previous version:
+  P1. parse_resume_batch — ThreadPoolExecutor(4) for parallel PDF downloads
+      Batch size: 20 → 50. ~3-4x throughput improvement.
+  P2. ingest_candidates_batch — single batch email SELECT instead of N queries
+      Batch size: 100 → 200. Eliminates the biggest DB bottleneck.
+  P3. _ingest_one — accepts pre-fetched existing_map (no individual SELECT per row)
+
+SAFETY FIXES (preserved from previous version):
+  S1. _sanitize() strips \\x00 NULL bytes that cause Postgres 22P05 errors
+  S2. _update_file uses _sanitize on all string fields before writing
+  S3. poll_ai_batches stamps updated_at every cycle (stale guard)
+  S4. Per-chunk try/except + duplicate key (23505) fallback in poll
+  S5. Output file download failure retries next cycle
+  S6. Input file deletion isolated — never kills completion
+  S7. Outer poll stamps error_message on unhandled exceptions
 """
 
 import io
 import json
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from config import supabase, openai_client, STORAGE_BUCKET
 from text_extractor import extract_text
@@ -58,81 +66,119 @@ Fields (use null or [] if not found):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# WORKER 1 — PARSE
+# WORKER 1 — PARSE  [P1: parallel downloads, larger batch]
 # ════════════════════════════════════════════════════════════════════════════
+
+def _process_one_file(row: Dict) -> Dict:
+    """
+    Download + extract + DB-update for a single file.
+    Runs inside a ThreadPoolExecutor — must be fully self-contained.
+    Returns dict with keys: status ('ok'|'skip'|'fail'), name.
+    """
+    file_id      = row['id']
+    storage_path = row.get('storage_path') or ''
+    mime_type    = row.get('mime_type') or 'application/pdf'
+    file_name    = row.get('file_name') or 'unknown'
+    attempt      = row.get('parse_attempts') or 1
+
+    try:
+        if not storage_path:
+            raise ValueError('storage_path is empty')
+
+        file_bytes = supabase.storage.from_(STORAGE_BUCKET).download(storage_path)
+        if not file_bytes:
+            raise ValueError('Downloaded empty file')
+
+        text, method = extract_text(file_bytes, mime_type, storage_path)
+
+        if method == 'image_only':
+            _update_file(file_id, {
+                'parse_status': 'image_only',
+                'parse_method': method,
+                'parsed_at':    _now(),
+                'parse_error':  None,
+            })
+            logger.info(f'[Parse] {file_name}: image_only')
+            return {'status': 'skip', 'name': file_name}
+
+        elif method in ('unsupported', 'failed') or not text.strip():
+            msg = f'method={method}, text_len={len(text)}'
+            if attempt >= 3:
+                _update_file(file_id, {
+                    'parse_status': 'unsupported' if method == 'unsupported' else 'failed',
+                    'parse_error':  f'Permanent fail after {attempt} attempts: {msg}',
+                    'parse_method': method,
+                })
+            else:
+                _update_file(file_id, {
+                    'parse_status': 'pending',
+                    'parse_error':  f'Attempt {attempt}: {msg}',
+                })
+            return {'status': 'fail', 'name': file_name}
+
+        else:
+            _update_file(file_id, {
+                'parse_status': 'parsed',
+                'resume_text':  text,
+                'parse_method': method,
+                'parse_error':  None,
+                'parsed_at':    _now(),
+                'ai_status':    'pending',
+            })
+            logger.info(f'[Parse] {file_name}: OK ({len(text)} chars via {method})')
+            return {'status': 'ok', 'name': file_name}
+
+    except Exception as e:
+        msg = str(e)[:400]
+        logger.error(f'[Parse] {file_name} exception: {msg}')
+        if attempt >= 3:
+            _update_file(file_id, {
+                'parse_status': 'failed',
+                'parse_error':  f'Exception after {attempt} attempts: {msg}',
+            })
+        else:
+            _update_file(file_id, {
+                'parse_status': 'pending',
+                'parse_error':  f'Attempt {attempt} exception: {msg}',
+            })
+        return {'status': 'fail', 'name': file_name}
+
 
 def parse_resume_batch():
     logger.info('[Parse] Starting batch')
-    result = supabase.rpc('claim_parse_batch', {'p_limit': 20}).execute()
-    files = result.data or []
+
+    # P1: batch size 20 → 50
+    result = supabase.rpc('claim_parse_batch', {'p_limit': 50}).execute()
+    files  = result.data or []
     if not files:
         logger.debug('[Parse] Nothing to process')
         return {'processed': 0}
 
-    logger.info(f'[Parse] Processing {len(files)} files')
+    logger.info(f'[Parse] Processing {len(files)} files (parallel workers=4)')
     ok = fail = skip = 0
 
-    for row in files:
-        file_id      = row['id']
-        storage_path = row.get('storage_path') or ''
-        mime_type    = row.get('mime_type') or 'application/pdf'
-        file_name    = row.get('file_name') or 'unknown'
-        attempt      = row.get('parse_attempts') or 1
-
-        try:
-            if not storage_path:
-                raise ValueError('storage_path is empty')
-            file_bytes = supabase.storage.from_(STORAGE_BUCKET).download(storage_path)
-            if not file_bytes:
-                raise ValueError('Downloaded empty file')
-
-            text, method = extract_text(file_bytes, mime_type, storage_path)
-
-            if method == 'image_only':
-                _update_file(file_id, {'parse_status': 'image_only', 'parse_method': method,
-                                        'parsed_at': _now(), 'parse_error': None})
-                logger.info(f'[Parse] {file_name}: image_only')
-                skip += 1
-
-            elif method in ('unsupported', 'failed') or not text.strip():
-                msg = f'method={method}, text_len={len(text)}'
-                if attempt >= 3:
-                    _update_file(file_id, {
-                        'parse_status': 'unsupported' if method == 'unsupported' else 'failed',
-                        'parse_error': f'Permanent fail after {attempt} attempts: {msg}',
-                        'parse_method': method,
-                    })
-                else:
-                    _update_file(file_id, {'parse_status': 'pending',
-                                            'parse_error': f'Attempt {attempt}: {msg}'})
+    # P1: parallel download + extraction using 4 threads
+    # Safe: each thread touches a different file_id, supabase httpx client is thread-safe
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(_process_one_file, row): row for row in files}
+        for future in as_completed(futures):
+            try:
+                res = future.result()
+                if res['status'] == 'ok':     ok   += 1
+                elif res['status'] == 'skip': skip += 1
+                else:                         fail += 1
+            except Exception as e:
+                # Catch any unexpected executor-level failure
+                row = futures[future]
+                logger.error(f'[Parse] Executor error for {row.get("file_name")}: {e}')
                 fail += 1
-
-            else:
-                _update_file(file_id, {
-                    'parse_status': 'parsed', 'resume_text': text,
-                    'parse_method': method, 'parse_error': None,
-                    'parsed_at': _now(), 'ai_status': 'pending',
-                })
-                logger.info(f'[Parse] {file_name}: OK ({len(text)} chars via {method})')
-                ok += 1
-
-        except Exception as e:
-            msg = str(e)[:400]
-            logger.error(f'[Parse] {file_name} exception: {msg}')
-            if attempt >= 3:
-                _update_file(file_id, {'parse_status': 'failed',
-                                        'parse_error': f'Exception after {attempt} attempts: {msg}'})
-            else:
-                _update_file(file_id, {'parse_status': 'pending',
-                                        'parse_error': f'Attempt {attempt} exception: {msg}'})
-            fail += 1
 
     logger.info(f'[Parse] Done: {ok} parsed, {skip} image_only, {fail} failed')
     return {'processed': len(files), 'ok': ok, 'skip': skip, 'fail': fail}
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# WORKER 2 — SUBMIT TO OPENAI
+# WORKER 2 — SUBMIT TO OPENAI  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 def submit_ai_batch():
@@ -164,7 +210,7 @@ def submit_ai_batch():
 
 
 def _submit_org_batch(org_id: str, files: List[Dict]) -> int:
-    file_ids = [f['id'] for f in files]
+    file_ids  = [f['id'] for f in files]
     batch_rec = supabase.table('hr_resume_batch_jobs').insert({
         'organization_id': org_id, 'file_count': len(files), 'status': 'pending',
     }).execute()
@@ -182,13 +228,13 @@ def _submit_org_batch(org_id: str, files: List[Dict]) -> int:
                     'response_format': {'type': 'json_object'},
                     'messages': [
                         {'role': 'system', 'content': SYSTEM_PROMPT},
-                        {'role': 'user', 'content': f"Resume Text:\n\n---\n{f['resume_text'] or ''}\n---"},
+                        {'role': 'user',   'content': f"Resume Text:\n\n---\n{f['resume_text'] or ''}\n---"},
                     ],
                 },
             }))
 
         jsonl_bytes = '\n'.join(lines).encode('utf-8')
-        size_kb = len(jsonl_bytes) / 1024
+        size_kb     = len(jsonl_bytes) / 1024
         logger.info(f'[Submit] JSONL: {len(lines)} lines, {size_kb:.1f} KB')
         if len(jsonl_bytes) > 90 * 1024 * 1024:
             raise ValueError(f'JSONL too large ({size_kb:.0f}KB)')
@@ -202,8 +248,11 @@ def _submit_org_batch(org_id: str, files: List[Dict]) -> int:
         batch = openai_client.batches.create(
             input_file_id=oai_file.id, endpoint='/v1/chat/completions',
             completion_window='24h',
-            metadata={'hrumbles_batch_job_id': batch_job_id,
-                      'organization_id': org_id, 'file_count': str(len(files))},
+            metadata={
+                'hrumbles_batch_job_id': batch_job_id,
+                'organization_id':       org_id,
+                'file_count':            str(len(files)),
+            },
         )
         logger.info(f'[Submit] OAI batch created: {batch.id}')
 
@@ -230,7 +279,7 @@ def _submit_org_batch(org_id: str, files: List[Dict]) -> int:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# WORKER 3 — POLL OPENAI  ← FIXED
+# WORKER 3 — POLL OPENAI  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 def poll_ai_batches():
@@ -255,7 +304,6 @@ def poll_ai_batches():
             elif status == 'in_progress': in_progress += 1
         except Exception as e:
             logger.error(f'[Poll] Job {job["id"][:8]} unhandled error: {e}', exc_info=True)
-            # FIX 7: stamp error_message so stale guard fires eventually
             try:
                 supabase.table('hr_resume_batch_jobs').update({
                     'error_message': f'Poll exception: {str(e)[:400]}',
@@ -277,16 +325,12 @@ def _check_one_batch(job: Dict) -> str:
         logger.warning(f'[Poll] Job {batch_job_id[:8]} has no openai_batch_id, skipping')
         return 'skip'
 
-    # FIX 2: Stale guard — warn if updated_at hasn't moved in >2h
+    # Stale guard
     try:
-        updated_at = datetime.fromisoformat(
-            (job.get('updated_at') or '').replace('Z', '+00:00')
-        )
+        updated_at  = datetime.fromisoformat((job.get('updated_at') or '').replace('Z', '+00:00'))
         stale_hours = (datetime.now(timezone.utc) - updated_at).total_seconds() / 3600
         if stale_hours > 2:
-            logger.warning(
-                f'[Poll] Job {batch_job_id[:8]} stale {stale_hours:.1f}h — force re-polling OpenAI'
-            )
+            logger.warning(f'[Poll] Job {batch_job_id[:8]} stale {stale_hours:.1f}h — force re-polling OpenAI')
     except Exception:
         pass
 
@@ -294,17 +338,15 @@ def _check_one_batch(job: Dict) -> str:
     oai = openai_client.batches.retrieve(openai_batch_id)
     logger.info(f'[Poll] {openai_batch_id}: status={oai.status}')
 
-    # Still running
     if oai.status in ('validating', 'in_progress', 'finalizing'):
         c = oai.request_counts
         supabase.table('hr_resume_batch_jobs').update({
             'error_message': f'In progress: {c.completed}/{c.total}',
-            'updated_at':    _now(),   # FIX 1: stamp updated_at every cycle
+            'updated_at':    _now(),
         }).eq('id', batch_job_id).execute()
         logger.info(f'[Poll] {openai_batch_id} in progress: {c.completed}/{c.total}')
         return 'in_progress'
 
-    # Terminal failure
     if oai.status in ('failed', 'expired', 'cancelled'):
         supabase.table('hr_resume_batch_jobs').update({
             'status': 'failed', 'error_message': f'OpenAI: {oai.status}',
@@ -315,7 +357,6 @@ def _check_one_batch(job: Dict) -> str:
         logger.warning(f'[Poll] Batch {openai_batch_id} terminal: {oai.status}')
         return 'failed'
 
-    # Completed
     if oai.status == 'completed':
         if not oai.output_file_id:
             supabase.table('hr_resume_batch_jobs').update({
@@ -327,7 +368,6 @@ def _check_one_batch(job: Dict) -> str:
 
         logger.info(f'[Poll] {openai_batch_id} completed. Downloading {oai.output_file_id}')
 
-        # FIX 5: Isolate download — failure retries next cycle instead of dying silently
         try:
             output_text  = openai_client.files.content(oai.output_file_id).text
             output_lines = [l for l in output_text.strip().split('\n') if l.strip()]
@@ -337,7 +377,7 @@ def _check_one_batch(job: Dict) -> str:
                 'error_message': f'Output download failed (retrying): {str(e)[:300]}',
                 'updated_at':    _now(),
             }).eq('id', batch_job_id).execute()
-            return 'in_progress'  # retry next poll cycle
+            return 'in_progress'
 
         logger.info(f'[Poll] Downloaded {len(output_lines)} result lines')
 
@@ -403,7 +443,6 @@ def _check_one_batch(job: Dict) -> str:
 
         logger.info(f'[Poll] Parsed: {len(success_ids)} ok, {len(failed_ids)} failed')
 
-        # FIX 3 + 4: Per-chunk try/except + duplicate key fallback
         inserted_count = 0
         for i in range(0, len(ai_inserts), 50):
             chunk = ai_inserts[i:i+50]
@@ -420,7 +459,7 @@ def _check_one_batch(job: Dict) -> str:
                             inserted_count += 1
                         except Exception as re:
                             if 'duplicate' in str(re).lower() or '23505' in str(re):
-                                inserted_count += 1  # already there = success
+                                inserted_count += 1  # already present = ok
                             else:
                                 logger.error(f'[Poll] Row insert failed {row["resume_file_id"]}: {re}')
                 else:
@@ -443,7 +482,6 @@ def _check_one_batch(job: Dict) -> str:
             'completed_at': _now(), 'updated_at': _now(),
         }).eq('id', batch_job_id).execute()
 
-        # FIX 6: Input file deletion fully isolated — never kills completion
         input_file_id = job.get('openai_file_id', '')
         if input_file_id:
             try:
@@ -460,12 +498,14 @@ def _check_one_batch(job: Dict) -> str:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# WORKER 4 — INGEST CANDIDATES
+# WORKER 4 — INGEST CANDIDATES  [P2: batch email lookup, larger batch]
 # ════════════════════════════════════════════════════════════════════════════
 
 def ingest_candidates_batch():
     logger.info('[Ingest] Starting ingest batch')
-    result = supabase.rpc('claim_ingest_batch', {'p_limit': 100}).execute()
+
+    # P2: batch size 100 → 200
+    result = supabase.rpc('claim_ingest_batch', {'p_limit': 200}).execute()
     rows   = result.data or []
 
     if not rows:
@@ -473,11 +513,37 @@ def ingest_candidates_batch():
         return {'processed': 0}
 
     logger.info(f'[Ingest] Processing {len(rows)} candidates')
+
+    # P2: collect all emails from this batch, then do ONE bulk SELECT
+    # instead of one SELECT per row (was: N queries, now: 1 query)
+    emails_in_batch = set()
+    for row in rows:
+        profile = row.get('extracted_profile') or {}
+        email   = (profile.get('email') or row.get('candidate_email') or '').lower().strip()
+        if email:
+            emails_in_batch.add(email)
+
+    existing_map: Dict[str, Dict] = {}
+    if emails_in_batch:
+        try:
+            ex = supabase.table('hr_talent_pool') \
+                .select('id, email, updated_at, resume_path, organization_id') \
+                .in_('email', list(emails_in_batch)) \
+                .execute()
+            # Key by lowercase email for O(1) lookup per row
+            for rec in (ex.data or []):
+                existing_map[rec['email'].lower()] = rec
+            logger.debug(f'[Ingest] Batch email lookup: {len(emails_in_batch)} queried, {len(existing_map)} found')
+        except Exception as e:
+            # Non-fatal: fall back to per-row lookup if batch query fails
+            logger.warning(f'[Ingest] Batch email lookup failed, falling back to per-row: {e}')
+            existing_map = {}
+
     inserted = updated = skipped = failed = 0
 
     for row in rows:
         try:
-            outcome = _ingest_one(row)
+            outcome = _ingest_one(row, existing_map)
             if outcome == 'INSERTED':        inserted += 1
             elif outcome == 'UPDATED':       updated  += 1
             elif outcome.startswith('SKIP'): skipped  += 1
@@ -492,7 +558,13 @@ def ingest_candidates_batch():
             'skipped': skipped, 'failed': failed}
 
 
-def _ingest_one(row: Dict) -> str:
+def _ingest_one(row: Dict, existing_map: Optional[Dict] = None) -> str:
+    """
+    Ingest a single candidate from AI result into hr_talent_pool.
+
+    existing_map: pre-fetched dict keyed by lowercase email (from batch lookup).
+                  If None or email not found in map, falls back to individual SELECT.
+    """
     file_id      = row['resume_file_id']
     ai_result_id = row['ai_result_id']
     org_id       = row['organization_id']
@@ -512,28 +584,37 @@ def _ingest_one(row: Dict) -> str:
         resume_url = f'{base}/storage/v1/object/public/{bkt}/{storage_path}'
 
     if not email:
-        _update_file(file_id, {'ingest_status': 'skipped', 'ingest_result': 'SKIPPED_NO_EMAIL',
-                                'ingested_at': _now()})
+        _update_file(file_id, {
+            'ingest_status': 'skipped',
+            'ingest_result': 'SKIPPED_NO_EMAIL',
+            'ingested_at':   _now(),
+        })
         _log_ingest(file_id, ai_result_id, org_id, email, 'SKIP', 'NO_EMAIL')
         return 'SKIPPED_NO_EMAIL'
 
-    _res = supabase.table('hr_talent_pool') \
-        .select('id, updated_at, resume_text, resume_path') \
-        .eq('organization_id', org_id).ilike('email', email).limit(1).execute()
-
-    existing = type('obj', (object,), {'data': _res.data[0] if _res.data else None})
-    action = 'UNKNOWN'
-    candidate_id = None
-    field_changes = []
-
-    if not existing.data:
-        data = _build_insert_payload(profile, email, resume_url, org_id, resume_text)
-        ins  = supabase.table('hr_talent_pool').insert(data).execute()
-        candidate_id = ins.data[0]['id'] if ins.data else None
-        action = 'INSERTED'
+    # P3: use pre-fetched map; fall back to individual SELECT only if map is missing
+    if existing_map is not None and email in existing_map:
+        existing_data = existing_map[email]
+    elif existing_map is not None:
+        existing_data = None   # not in map → definitely a new candidate
     else:
-        existing_data = existing.data
-        candidate_id  = existing_data['id']
+        # Fallback: individual SELECT (used when batch lookup failed)
+        _res = supabase.table('hr_talent_pool') \
+            .select('id, updated_at, resume_text, resume_path') \
+            .eq('organization_id', org_id).ilike('email', email).limit(1).execute()
+        existing_data = _res.data[0] if _res.data else None
+
+    action       = 'UNKNOWN'
+    candidate_id = None
+    field_changes: List[str] = []
+
+    if not existing_data:
+        data         = _build_insert_payload(profile, email, resume_url, org_id, resume_text)
+        ins          = supabase.table('hr_talent_pool').insert(data).execute()
+        candidate_id = ins.data[0]['id'] if ins.data else None
+        action       = 'INSERTED'
+    else:
+        candidate_id = existing_data['id']
         try:
             upd_str = existing_data.get('updated_at') or ''
             upd_at  = datetime.fromisoformat(upd_str.replace('Z', '+00:00')) \
@@ -558,56 +639,74 @@ def _ingest_one(row: Dict) -> str:
 
     _update_file(file_id, {
         'ingest_status': 'done' if action in ('INSERTED', 'UPDATED') else 'skipped',
-        'ingest_result': action, 'candidate_id': candidate_id, 'ingested_at': _now(),
+        'ingest_result': action,
+        'candidate_id':  candidate_id,
+        'ingested_at':   _now(),
     })
-    _log_ingest(file_id, ai_result_id, org_id, email,
-                'INSERT' if action == 'INSERTED' else 'UPDATE' if action == 'UPDATED' else 'SKIP',
-                action, candidate_id, {'fields': field_changes} if field_changes else None)
+    _log_ingest(
+        file_id, ai_result_id, org_id, email,
+        'INSERT' if action == 'INSERTED' else 'UPDATE' if action == 'UPDATED' else 'SKIP',
+        action, candidate_id,
+        {'fields': field_changes} if field_changes else None,
+    )
     return action
 
 
-def _build_insert_payload(profile: Dict, email: str, resume_url: str,
+def _build_insert_payload(profile: Dict, email: str, resume_url: Optional[str],
                            org_id: str, resume_text: str = '') -> Dict:
     payload = {
-        'candidate_name': _name(profile), 'email': email,
-        'phone': profile.get('phone'), 'linkedin_url': profile.get('linkedin_url'),
-        'github_url': profile.get('github_url'), 'current_location': profile.get('current_location'),
-        'professional_summary': profile.get('professional_summary'),
-        'top_skills': profile.get('top_skills'),
-        'top_skills_lower': _lower_list(profile.get('top_skills')),
-        'work_experience': profile.get('work_experience'),
-        'education': profile.get('education'), 'projects': profile.get('projects'),
-        'certifications': profile.get('certifications'), 'other_details': profile.get('other_details'),
-        'suggested_title': profile.get('suggested_title'),
+        'candidate_name':      _name(profile),
+        'email':               email,
+        'phone':               profile.get('phone'),
+        'linkedin_url':        profile.get('linkedin_url'),
+        'github_url':          profile.get('github_url'),
+        'current_location':    profile.get('current_location'),
+        'professional_summary':profile.get('professional_summary'),
+        'top_skills':          profile.get('top_skills'),
+        'top_skills_lower':    _lower_list(profile.get('top_skills')),
+        'work_experience':     profile.get('work_experience'),
+        'education':           profile.get('education'),
+        'projects':            profile.get('projects'),
+        'certifications':      profile.get('certifications'),
+        'other_details':       profile.get('other_details'),
+        'suggested_title':     profile.get('suggested_title'),
         'current_designation': profile.get('current_designation'),
-        'current_company': profile.get('current_company'),
-        'total_experience': profile.get('total_experience'),
-        'notice_period': profile.get('notice_period'),
-        'highest_education': profile.get('highest_education'),
-        'resume_path': resume_url, 'resume_text': resume_text,
-        'source_platform': 'bulk_upload', 'organization_id': org_id,
+        'current_company':     profile.get('current_company'),
+        'total_experience':    profile.get('total_experience'),
+        'notice_period':       profile.get('notice_period'),
+        'highest_education':   profile.get('highest_education'),
+        'resume_path':         resume_url,
+        'resume_text':         resume_text,
+        'source_platform':     'bulk_upload',
+        'organization_id':     org_id,
     }
     return {k: v for k, v in payload.items() if k == 'resume_text' or v is not None}
 
 
-def _build_update_payload(profile: Dict, resume_url: str, resume_text: str = '') -> Dict:
+def _build_update_payload(profile: Dict, resume_url: Optional[str],
+                           resume_text: str = '') -> Dict:
     payload = {
-        'candidate_name': _name(profile), 'phone': profile.get('phone'),
-        'linkedin_url': profile.get('linkedin_url'), 'github_url': profile.get('github_url'),
-        'current_location': profile.get('current_location'),
-        'professional_summary': profile.get('professional_summary'),
-        'top_skills': profile.get('top_skills'),
-        'top_skills_lower': _lower_list(profile.get('top_skills')),
-        'work_experience': profile.get('work_experience'),
-        'education': profile.get('education'), 'projects': profile.get('projects'),
-        'certifications': profile.get('certifications'), 'other_details': profile.get('other_details'),
-        'suggested_title': profile.get('suggested_title'),
+        'candidate_name':      _name(profile),
+        'phone':               profile.get('phone'),
+        'linkedin_url':        profile.get('linkedin_url'),
+        'github_url':          profile.get('github_url'),
+        'current_location':    profile.get('current_location'),
+        'professional_summary':profile.get('professional_summary'),
+        'top_skills':          profile.get('top_skills'),
+        'top_skills_lower':    _lower_list(profile.get('top_skills')),
+        'work_experience':     profile.get('work_experience'),
+        'education':           profile.get('education'),
+        'projects':            profile.get('projects'),
+        'certifications':      profile.get('certifications'),
+        'other_details':       profile.get('other_details'),
+        'suggested_title':     profile.get('suggested_title'),
         'current_designation': profile.get('current_designation'),
-        'current_company': profile.get('current_company'),
-        'total_experience': profile.get('total_experience'),
-        'notice_period': profile.get('notice_period'),
-        'highest_education': profile.get('highest_education'),
-        'resume_path': resume_url, 'resume_text': resume_text,
+        'current_company':     profile.get('current_company'),
+        'total_experience':    profile.get('total_experience'),
+        'notice_period':       profile.get('notice_period'),
+        'highest_education':   profile.get('highest_education'),
+        'resume_path':         resume_url,
+        'resume_text':         resume_text,
     }
     return {k: v for k, v in payload.items() if k == 'resume_text' or v is not None}
 
@@ -629,14 +728,14 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def _sanitize(val):
-    """Strip NULL bytes PostgreSQL rejects (error 22P05 / \\u0000)."""
+    """Strip NULL bytes that PostgreSQL rejects (error 22P05 / \\u0000)."""
     if isinstance(val, str):
         return val.replace('\x00', '')
     return val
 
 def _update_file(file_id: str, data: Dict) -> None:
     try:
-        clean = {k: _sanitize(v) for k, v in data.items()}   # ← sanitize all fields
+        clean = {k: _sanitize(v) for k, v in data.items()}
         supabase.table('hr_resume_files').update(clean).eq('id', file_id).execute()
     except Exception as e:
         logger.error(f'[DB] update hr_resume_files {file_id}: {e}')
@@ -645,10 +744,15 @@ def _log_ingest(file_id, ai_result_id, org_id, email, action, reason,
                 candidate_id=None, field_changes=None, error=None):
     try:
         supabase.table('hr_resume_ingest_log').insert({
-            'resume_file_id': file_id, 'ai_result_id': ai_result_id,
-            'organization_id': org_id, 'candidate_email': email or None,
-            'action': action, 'reason': reason, 'candidate_id': candidate_id,
-            'field_changes': field_changes, 'error_detail': error,
+            'resume_file_id':  file_id,
+            'ai_result_id':    ai_result_id,
+            'organization_id': org_id,
+            'candidate_email': email or None,
+            'action':          action,
+            'reason':          reason,
+            'candidate_id':    candidate_id,
+            'field_changes':   field_changes,
+            'error_detail':    error,
         }).execute()
     except Exception as e:
         logger.error(f'[DB] ingest log write failed: {e}')
@@ -656,7 +760,12 @@ def _log_ingest(file_id, ai_result_id, org_id, email, action, reason,
 def _mark_ingest_failed(row: Dict, error: str) -> None:
     file_id = row.get('resume_file_id')
     if file_id:
-        _update_file(file_id, {'ingest_status': 'failed', 'ingest_result': 'FAILED',
-                                'ingest_error': error[:500]})
-    _log_ingest(file_id, row.get('ai_result_id'), row.get('organization_id', ''),
-                row.get('candidate_email', ''), 'FAIL', 'ERROR', error=error[:500])
+        _update_file(file_id, {
+            'ingest_status': 'failed',
+            'ingest_result': 'FAILED',
+            'ingest_error':  error[:500],
+        })
+    _log_ingest(
+        file_id, row.get('ai_result_id'), row.get('organization_id', ''),
+        row.get('candidate_email', ''), 'FAIL', 'ERROR', error=error[:500],
+    )

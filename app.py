@@ -57,10 +57,10 @@ scheduler = BackgroundScheduler(timezone='UTC')
 scheduler.add_listener(_on_error,  EVENT_JOB_ERROR)
 scheduler.add_listener(_on_missed, EVENT_JOB_MISSED)
 
-scheduler.add_job(lambda: _enqueue('parse_resume_batch',      300), 'interval', seconds=15,  id='parse',   max_instances=1, coalesce=True, misfire_grace_time=10)
+scheduler.add_job(lambda: _enqueue('parse_resume_batch',      300), 'interval', seconds=10,  id='parse',   max_instances=1, coalesce=True, misfire_grace_time=10)
 scheduler.add_job(lambda: _enqueue('submit_ai_batch',         600), 'interval', minutes=5,   id='submit',  max_instances=1, coalesce=True, misfire_grace_time=60)
 scheduler.add_job(lambda: _enqueue('poll_ai_batches',         600), 'interval', minutes=10,  id='poll',    max_instances=1, coalesce=True, misfire_grace_time=60)
-scheduler.add_job(lambda: _enqueue('ingest_candidates_batch', 600), 'interval', seconds=30,  id='ingest',  max_instances=1, coalesce=True, misfire_grace_time=15)
+scheduler.add_job(lambda: _enqueue('ingest_candidates_batch', 600), 'interval', seconds=15,  id='ingest',  max_instances=1, coalesce=True, misfire_grace_time=15)
 
 scheduler.add_job(
     _reset_stuck,
@@ -73,7 +73,7 @@ scheduler.add_job(
 )
 
 scheduler.start()
-logger.info('[Scheduler] Started: parse/15s, submit/5m, poll/10m, ingest/30s')
+logger.info('[Scheduler] Started: parse/10s, submit/5m, poll/10m, ingest/15s')
 
 
 # ════════════════════════════════════════════════════════════════════════════
