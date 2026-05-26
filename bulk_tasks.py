@@ -628,9 +628,16 @@ def _lower_list(skills) -> list:
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def _sanitize(val):
+    """Strip NULL bytes PostgreSQL rejects (error 22P05 / \\u0000)."""
+    if isinstance(val, str):
+        return val.replace('\x00', '')
+    return val
+
 def _update_file(file_id: str, data: Dict) -> None:
     try:
-        supabase.table('hr_resume_files').update(data).eq('id', file_id).execute()
+        clean = {k: _sanitize(v) for k, v in data.items()}   # ← sanitize all fields
+        supabase.table('hr_resume_files').update(clean).eq('id', file_id).execute()
     except Exception as e:
         logger.error(f'[DB] update hr_resume_files {file_id}: {e}')
 

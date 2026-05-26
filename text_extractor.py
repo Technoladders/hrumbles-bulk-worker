@@ -91,13 +91,13 @@ def extract_text(file_bytes: bytes, mime_type: str, storage_path: str = None) ->
         try:
             text = _extract_pdfminer(file_bytes)
             if len(text.strip()) >= MIN_TEXT_LENGTH:
-                return text.strip(), 'pdfminer'
+                return text.strip().replace('\x00', ''), 'pdfminer'
         except Exception as e:
             logger.warning(f'pdfminer failed: {e}')
         try:
             text = _extract_pypdf(file_bytes)
             if len(text.strip()) >= MIN_TEXT_LENGTH:
-                return text.strip(), 'pypdf'
+                return text.strip().replace('\x00', ''), 'pypdf'
         except Exception as e:
             logger.warning(f'pypdf failed: {e}')
         return '', 'image_only'
@@ -112,7 +112,7 @@ def extract_text(file_bytes: bytes, mime_type: str, storage_path: str = None) ->
         try:
             text = _extract_docx(file_bytes)
             if len(text.strip()) >= 50:
-                return text.strip(), 'docx'
+                return text.strip().replace('\x00', ''), 'docx'
             return '', 'failed'
         except Exception as e:
             logger.error(f'DOCX failed: {e}')
@@ -123,12 +123,12 @@ def extract_text(file_bytes: bytes, mime_type: str, storage_path: str = None) ->
         # Strategy 1: antiword
         text = _extract_doc_antiword(file_bytes)
         if len(text.strip()) >= 50:
-            return text.strip(), 'antiword'
+            return text.strip().replace('\x00', ''), 'antiword'
         # Strategy 2: existing parser container
         if storage_path:
             text = _extract_doc_via_parser(storage_path)
             if len(text.strip()) >= 50:
-                return text.strip(), 'doc_api'
+                return text.strip().replace('\x00', ''), 'doc_api'
         logger.warning(f'DOC failed completely: {storage_path}')
         return '', 'failed'
 
