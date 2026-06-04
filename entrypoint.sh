@@ -23,11 +23,12 @@ try:
     print('    Stuck files reset OK')
 except Exception as e:
     print(f'    Warning: could not reset stuck files: {e}')
+    print('    Continuing startup...')
 "
 
-# ── Watchdog: restarts RQ worker whenever it exits ──────────────────────────
 echo ">>> Starting RQ worker watchdog..."
 (
+  set +e  # ← CRITICAL FIX: stops set -e from killing the loop on worker exit
   while true; do
     echo ">>> [Watchdog] Starting RQ worker..."
     rq worker bulk-pipeline \
