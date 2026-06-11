@@ -12,7 +12,7 @@ RENAMED from yohr/config.py to avoid shadowing the root config.py module.
 from config import supabase, openai_client, RESUME_PARSER_URL, STORAGE_BUCKET  # noqa: F401
 
 # ── YOHR-specific constants ───────────────────────────────────────────────────
-YOHR_ORG_ID          = "2e569073-86de-4199-9d36-99dfe4d2e8f6"
+YOHR_ORG_ID          = "53989f03-bdc9-439a-901c-45b274eff506"
 RESUME_PATH_PREFIX   = "yohr-csv"       # stored as {org_id}/yohr-csv/{session}/{file}
 
 OPENAI_MODEL         = "gpt-4.1-nano"
