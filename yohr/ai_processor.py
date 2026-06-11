@@ -11,7 +11,7 @@ import requests
 
 from .constants import (                                    # ← .constants not .config
     supabase, openai_client, YOHR_ORG_ID,
-    STORAGE_BUCKET, RESUME_PARSER_URL,
+    STORAGE_BUCKET,
     OPENAI_MODEL, MAX_AI_TOKENS, RESUME_TEXT_LIMIT,
     MAX_AI_WORKERS, MAX_AI_RETRIES,
 )
@@ -134,19 +134,33 @@ def _process_row(row: dict) -> None:
 
 
 def _extract_text(storage_path: str) -> str:
-    """Download PDF from storage, send to resume-parser container, return raw text."""
+    """Download PDF from storage, extract text locally using pypdf + pdfminer fallback.
+    NO HTTP call — both libraries are already installed in the container."""
+    import io
+
     pdf_bytes: bytes = supabase.storage.from_(STORAGE_BUCKET).download(storage_path)
-    # RESUME_PARSER_URL is the existing env var: http://localhost:5005
-    resp = requests.post(
-        RESUME_PARSER_URL,
-        data=pdf_bytes,
-        headers={"Content-Type": "application/pdf"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    # resume-parser returns { "text": "..." }
-    return data.get("text", "")
+
+    # Try pypdf first (faster)
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(io.BytesIO(pdf_bytes))
+        pages = []
+        for page in reader.pages:
+            t = page.extract_text()
+            if t:
+                pages.append(t)
+        text = "\n".join(pages).strip()
+        if text:
+            return text
+    except Exception:
+        pass
+
+    # Fallback: pdfminer.six (better for complex PDFs)
+    try:
+        from pdfminer.high_level import extract_text as pm_extract
+        return pm_extract(io.BytesIO(pdf_bytes)) or ""
+    except Exception:
+        return ""
 
 
 def _call_ai(resume_text: str) -> dict:
