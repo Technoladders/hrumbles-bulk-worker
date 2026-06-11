@@ -22,6 +22,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from config import supabase, bulk_queue, PORT
+from yohr.scheduler import register_yohr_jobs
 
 app    = Flask(__name__)
 CORS(app, resources={r'/api/*': {'origins': '*'}})
@@ -71,6 +72,8 @@ scheduler.add_job(
     coalesce=True,
     misfire_grace_time=60
 )
+
+register_yohr_jobs(scheduler)
 
 scheduler.start()
 logger.info('[Scheduler] Started: parse/10s, submit/5m, poll/10m, ingest/15s')
@@ -209,6 +212,31 @@ def ingest_log():
         .execute()
 
     return jsonify({'logs': result.data or [], 'count': len(result.data or [])})
+
+@app.route('/yohr/trigger', methods=['POST'])
+def yohr_trigger():
+    """
+    Called by the yohr-csv-intake edge function right after a CSV upload.
+    Kicks the csv-parser job so it fires immediately instead of waiting.
+    """
+
+    key = request.headers.get('X-Worker-Key', '')
+
+    if not key or key != os.environ.get('YOHR_TRIGGER_KEY', ''):
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        import datetime
+
+        job = scheduler.get_job('yohr_s1_csv_parser')
+
+        if job:
+            job.modify(next_run_time=datetime.datetime.now())
+
+    except Exception:
+        pass
+
+    return jsonify({'status': 'ok'})
 
 
 # ════════════════════════════════════════════════════════════════════════════
