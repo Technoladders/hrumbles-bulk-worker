@@ -16,8 +16,8 @@ YOHR_ORG_ID          = "53989f03-bdc9-439a-901c-45b274eff506"
 RESUME_PATH_PREFIX   = "yohr-csv"       # stored as {org_id}/yohr-csv/{session}/{file}
 
 OPENAI_MODEL         = "gpt-4.1-nano"
-MAX_AI_TOKENS        = 380
-RESUME_TEXT_LIMIT    = 3000             # chars sent to AI per resume
+MAX_AI_TOKENS        = 700
+RESUME_TEXT_LIMIT    = 8000             # chars sent to AI per resume
 MAX_AI_WORKERS       = 5               # concurrent live API calls
 
 MAX_DOWNLOAD_WORKERS = 8
