@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .constants import (
-    supabase, openai_client, YOHR_ORG_ID,
+    supabase, openai_client, ACTIVE_ORG_IDS,
     STORAGE_BUCKET,
     OPENAI_MODEL, MAX_AI_TOKENS, MAX_AI_INPUT_CHARS,
     MAX_AI_WORKERS, MAX_AI_RETRIES,
@@ -325,7 +325,7 @@ def run_ai_processor() -> None:
                 "id, session_id, stored_resume_path, raw_name, raw_designation, "
                 "raw_company, raw_location, s3_attempts, resume_text_excerpt"
             )
-            .eq("org_id", YOHR_ORG_ID)
+            .eq("org_id", ACTIVE_ORG_IDS)
             .in_("s2_status", ["done", "skipped"])
             .eq("s3_status", "pending")
             .limit(50)

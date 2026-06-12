@@ -15,7 +15,7 @@ import logging
 import re
 from typing import Any, Optional
 
-from .constants import supabase, YOHR_ORG_ID, ACTIVE_ORG_IDS, STORAGE_PUBLIC_BASE
+from .constants import supabase, ACTIVE_ORG_IDS, ACTIVE_ORG_IDS, STORAGE_PUBLIC_BASE
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +138,7 @@ def _build_talent_record(row: dict) -> tuple[Optional[dict], list[str]]:
     record = {
         # Identity
         "email":           email,
-        "organization_id": YOHR_ORG_ID,
+        "organization_id": ACTIVE_ORG_IDS,
         "candidate_name":  _safe_str(row.get("raw_name")) or _safe_str(ai.get("candidate_name")),
 
         # Contact

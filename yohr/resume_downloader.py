@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 import requests
 
 from .constants import (                                    # ← .constants not .config
-    supabase, YOHR_ORG_ID, STORAGE_BUCKET, RESUME_PATH_PREFIX,
+    supabase, ACTIVE_ORG_IDS, STORAGE_BUCKET, RESUME_PATH_PREFIX,
     MAX_DOWNLOAD_WORKERS, MAX_DOWNLOAD_RETRIES, DOWNLOAD_TIMEOUT,
 )
 
@@ -31,7 +31,7 @@ def _storage_path(session_id: str, original_url: str) -> str:
     filename = safe_filename(parsed.path.split("/")[-1])
     if not filename.lower().endswith(".pdf"):
         filename += ".pdf"
-    return f"{YOHR_ORG_ID}/{RESUME_PATH_PREFIX}/{session_id}/{filename}"
+    return f"{ACTIVE_ORG_IDS}/{RESUME_PATH_PREFIX}/{session_id}/{filename}"
 
 
 def run_downloader() -> None:
@@ -39,7 +39,7 @@ def run_downloader() -> None:
         rows = (
             supabase.table("org_csv_import_rows")
             .select("id, session_id, raw_resume_url, s2_attempts")
-            .eq("org_id", YOHR_ORG_ID)
+            .eq("org_id", ACTIVE_ORG_IDS)
             .eq("s1_status", "done")
             .eq("s2_status", "pending")
             .limit(80)
