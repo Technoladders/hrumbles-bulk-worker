@@ -5,12 +5,12 @@ Imports shared clients from ROOT config.py.
 import os
 from config import supabase, openai_client, STORAGE_BUCKET  # noqa: F401
 
-ACTIVE_ORG_IDS    = "2e569073-86de-4199-9d36-99dfe4d2e8f6"
+YOHR_ORG_ID    = "2e569073-86de-4199-9d36-99dfe4d2e8f6"
 # Demo org used for testing — remove from this list when going live
 DEMO_ORG_ID    = "53989f03-bdc9-439a-901c-45b274eff506"
  
 # All orgs the pipeline should process (include demo during testing)
-ACTIVE_ORG_IDS = [ACTIVE_ORG_IDS, DEMO_ORG_ID]
+ACTIVE_ORG_IDS = [YOHR_ORG_ID, DEMO_ORG_ID]
 RESUME_PATH_PREFIX = "yohr-csv"
 
 OPENAI_MODEL       = "gpt-4.1-nano"
