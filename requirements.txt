@@ -12,3 +12,5 @@ requests==2.32.3
 python-dotenv==1.0.1
 tenacity==8.5.0
 phonenumbers==8.13.43
+pycountry==24.6.1
+country_converter==1.2

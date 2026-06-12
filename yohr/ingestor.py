@@ -15,7 +15,7 @@ import logging
 import re
 from typing import Any, Optional
 
-from .constants import supabase, YOHR_ORG_ID, STORAGE_PUBLIC_BASE
+from .constants import supabase, YOHR_ORG_ID, ACTIVE_ORG_IDS, STORAGE_PUBLIC_BASE
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,11 @@ def _build_talent_record(row: dict) -> tuple[Optional[dict], list[str]]:
         "session_id":  row.get("session_id"),
         "csv_row_id":  row.get("id"),
     }
+    # Preserve raw CSV phone — important when Excel sci notation truncated digits
+    # e.g. actual 919766748078 was saved as "9.19767E+11" in CSV
+    raw_phone_csv = (row.get("raw_extra_fields") or {}).get("_raw_phone_csv") or row.get("raw_phone")
+    if raw_phone_csv:
+        other_details["raw_phone"] = raw_phone_csv
     if isinstance(ai_other, dict):
         other_details.update(ai_other)
 
@@ -258,7 +263,7 @@ def run_ingestor() -> None:
                 "parsed_phone, parsed_linkedin, "
                 "stored_resume_path, ai_result, resume_text_excerpt"
             )
-            .eq("org_id", YOHR_ORG_ID)
+            .in_("org_id", ACTIVE_ORG_IDS)
             .in_("s3_status", ["done", "skipped"])
             .eq("s4_status", "pending")
             .limit(60)
