@@ -4,7 +4,7 @@ Stage 4 — upsert fully-structured AI result into hr_talent_pool.
 
 Key changes vs previous version:
   - Maps ALL AI fields: work_experience, education, projects, certifications,
-    professional_summary, suggested_title, total_experience, etc.
+    suggested_title, total_experience, etc.
   - resume_path stored as FULL PUBLIC URL (not relative storage path)
   - resume_text stores FULL extracted text (from resume_text_excerpt)
   - CSV values (company, designation, notice, location) take priority over AI
@@ -101,15 +101,7 @@ def _build_talent_record(row: dict) -> tuple[Optional[dict], list[str]]:
         if current_designation:        parts.append(f"Title: {current_designation}")
         if current_company:            parts.append(f"Company: {current_company}")
         if current_location:           parts.append(f"Location: {current_location}")
-        ai_summary = ai.get("professional_summary")
-        if isinstance(ai_summary, list) and ai_summary:
-            parts.extend(ai_summary[:3])
         resume_text = "\n".join(parts) or f"Candidate: {row.get('raw_name', 'Unknown')}"
-
-    # ── Professional summary (TEXT column, stored as JSON array string) ──
-    prof_summary_raw = ai.get("professional_summary")
-    professional_summary = _json_str(prof_summary_raw) if isinstance(prof_summary_raw, list) else \
-                           _safe_str(prof_summary_raw)
 
     # ── Structured fields (TEXT columns, stored as JSON strings) ─────────
     work_experience = _json_str(ai.get("work_experience"))
@@ -159,7 +151,6 @@ def _build_talent_record(row: dict) -> tuple[Optional[dict], list[str]]:
         # Resume content
         "resume_path":           _to_url(row.get("stored_resume_path")),
         "resume_text":           resume_text,          # full extracted text (NOT NULL)
-        "professional_summary":  professional_summary,
         "work_experience":       work_experience,
         "education":             education,
         "projects":              projects,

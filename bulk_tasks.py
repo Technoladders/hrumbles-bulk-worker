@@ -50,11 +50,10 @@ Fields (use null or [] if not found):
 "linkedin_url": string or null — must be a valid URL
 "github_url": string or null — must be a valid URL
 "current_location": string or null — city/address
-"professional_summary": array of strings — bullet points
 "top_skills": array of strings — key skills
 "work_experience": array of {"company": str, "designation": str, "duration": str, "responsibilities": [str]}
 "education": array of {"institution": str, "degree": str, "year": str}
-"projects": array of strings — copy project blocks fully, do not summarize
+"projects": array of strings — project titles/names only, one short string per project (no descriptions)
 "certifications": array of strings
 "other_details": object or null — any other structured sections
 "total_experience": string — e.g. "5 years" if inferable
@@ -661,7 +660,6 @@ def _build_insert_payload(profile: Dict, email: str, resume_url: Optional[str],
         'linkedin_url':        profile.get('linkedin_url'),
         'github_url':          profile.get('github_url'),
         'current_location':    profile.get('current_location'),
-        'professional_summary':profile.get('professional_summary'),
         'top_skills':          profile.get('top_skills'),
         'top_skills_lower':    _lower_list(profile.get('top_skills')),
         'work_experience':     profile.get('work_experience'),
@@ -691,7 +689,6 @@ def _build_update_payload(profile: Dict, resume_url: Optional[str],
         'linkedin_url':        profile.get('linkedin_url'),
         'github_url':          profile.get('github_url'),
         'current_location':    profile.get('current_location'),
-        'professional_summary':profile.get('professional_summary'),
         'top_skills':          profile.get('top_skills'),
         'top_skills_lower':    _lower_list(profile.get('top_skills')),
         'work_experience':     profile.get('work_experience'),

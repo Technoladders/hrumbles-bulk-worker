@@ -42,11 +42,10 @@ Fields (use null or [] if not found):
 "linkedin_url": string or null — must be a valid URL
 "github_url": string or null — must be a valid URL
 "current_location": string or null — city/address
-"professional_summary": array of strings — exact text from Summary/Profile/Overview section split by sentences or bullets
 "top_skills": array of strings — all skills listed exactly as written
 "work_experience": array of {"company": str, "designation": str, "duration": str, "responsibilities": [str]}
 "education": array of {"institution": str, "degree": str, "year": str}
-"projects": array of strings — copy project blocks fully, do not summarize
+"projects": array of strings — project titles/names only, one short string per project (no descriptions)
 "certifications": array of strings
 "other_details": object or null — any other structured sections (languages, awards, publications, etc.)
 "total_experience": string or null — total experience exactly as stated in resume (e.g. "5 years", "12+ years")
@@ -64,7 +63,6 @@ EMPTY_AI_RESULT: dict = {
     "linkedin_url": None,
     "github_url": None,
     "current_location": None,
-    "professional_summary": [],
     "top_skills": [],
     "work_experience": [],
     "education": [],
@@ -249,7 +247,7 @@ def _call_ai(full_text: str) -> dict:
     result = {**EMPTY_AI_RESULT, **parsed}
 
     # Normalise list fields
-    for list_key in ("professional_summary", "top_skills", "work_experience",
+    for list_key in ("top_skills", "work_experience",
                      "education", "projects", "certifications"):
         if not isinstance(result.get(list_key), list):
             result[list_key] = []
