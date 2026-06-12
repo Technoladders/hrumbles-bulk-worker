@@ -5,7 +5,7 @@ Imports shared clients from ROOT config.py.
 import os
 from config import supabase, openai_client, STORAGE_BUCKET  # noqa: F401
 
-YOHR_ORG_ID        = "2e569073-86de-4199-9d36-99dfe4d2e8f6"
+YOHR_ORG_ID        = "53989f03-bdc9-439a-901c-45b274eff506"
 RESUME_PATH_PREFIX = "yohr-csv"
 
 OPENAI_MODEL       = "gpt-4.1-nano"
