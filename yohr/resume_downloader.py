@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from .constants import (                                    # ← .constants not .config
+from .constants import (
     supabase, ACTIVE_ORG_IDS, STORAGE_BUCKET, RESUME_PATH_PREFIX,
     MAX_DOWNLOAD_WORKERS, MAX_DOWNLOAD_RETRIES, DOWNLOAD_TIMEOUT,
 )
@@ -26,20 +26,20 @@ def safe_filename(raw_name: str) -> str:
     return clean or "resume"
 
 
-def _storage_path(session_id: str, original_url: str) -> str:
+def _storage_path(org_id: str, session_id: str, original_url: str) -> str:
     parsed   = urlparse(original_url)
     filename = safe_filename(parsed.path.split("/")[-1])
     if not filename.lower().endswith(".pdf"):
         filename += ".pdf"
-    return f"{ACTIVE_ORG_IDS}/{RESUME_PATH_PREFIX}/{session_id}/{filename}"
+    return f"{org_id}/{RESUME_PATH_PREFIX}/{session_id}/{filename}"
 
 
 def run_downloader() -> None:
     try:
         rows = (
             supabase.table("org_csv_import_rows")
-            .select("id, session_id, raw_resume_url, s2_attempts")
-            .eq("org_id", ACTIVE_ORG_IDS)
+            .select("id, session_id, org_id, raw_resume_url, s2_attempts")
+            .in_("org_id", ACTIVE_ORG_IDS)
             .eq("s1_status", "done")
             .eq("s2_status", "pending")
             .limit(80)
@@ -90,7 +90,8 @@ def _download_row(row: dict) -> None:
         if len(pdf_bytes) < 100:
             raise ValueError(f"Response too small ({len(pdf_bytes)} bytes)")
 
-        storage_path = _storage_path(session_id, url)
+        org_id = row.get("org_id", "")
+        storage_path = _storage_path(org_id, session_id, url)
         supabase.storage.from_(STORAGE_BUCKET).upload(
             path=storage_path,
             file=pdf_bytes,

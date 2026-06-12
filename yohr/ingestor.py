@@ -15,7 +15,7 @@ import logging
 import re
 from typing import Any, Optional
 
-from .constants import supabase, ACTIVE_ORG_IDS, ACTIVE_ORG_IDS, STORAGE_PUBLIC_BASE
+from .constants import supabase, YOHR_ORG_ID, ACTIVE_ORG_IDS, STORAGE_PUBLIC_BASE
 
 logger = logging.getLogger(__name__)
 
@@ -138,11 +138,13 @@ def _build_talent_record(row: dict) -> tuple[Optional[dict], list[str]]:
     record = {
         # Identity
         "email":           email,
-        "organization_id": ACTIVE_ORG_IDS,
+        "organization_id": row.get("org_id") or YOHR_ORG_ID,
         "candidate_name":  _safe_str(row.get("raw_name")) or _safe_str(ai.get("candidate_name")),
 
         # Contact
-        "phone":           row.get("parsed_phone") or _safe_str(ai.get("phone")),
+        # Phone: prefer AI-extracted (from actual PDF — correct even when CSV had sci notation)
+        # Fall back to CSV-parsed phone if AI didn't extract one
+        "phone":           _safe_str(ai.get("phone")) or row.get("parsed_phone"),
         "linkedin_url":    row.get("parsed_linkedin") or _safe_str(ai.get("linkedin_url")),
         "github_url":      _safe_str(ai.get("github_url")),
 

@@ -325,7 +325,7 @@ def run_ai_processor() -> None:
                 "id, session_id, stored_resume_path, raw_name, raw_designation, "
                 "raw_company, raw_location, s3_attempts, resume_text_excerpt"
             )
-            .eq("org_id", ACTIVE_ORG_IDS)
+            .in_("org_id", ACTIVE_ORG_IDS)
             .in_("s2_status", ["done", "skipped"])
             .eq("s3_status", "pending")
             .limit(50)
