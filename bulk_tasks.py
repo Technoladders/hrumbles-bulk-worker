@@ -23,6 +23,14 @@ SAFETY FIXES (preserved from previous version):
   S5. Output file download failure retries next cycle
   S6. Input file deletion isolated — never kills completion
   S7. Outer poll stamps error_message on unhandled exceptions
+
+DATA INTEGRITY FIX (this version):
+  D1. claim_ingest_batch RPC now returns uploaded_by (see migration
+      migration_uploaded_by_fix.sql — the RPC was updated to select
+      f.uploaded_by from hr_resume_files, since hr_resume_ai_results.resume_file_id
+      already links back to the file that carries uploader identity).
+      _ingest_one now sets created_by on insert and updated_by on both
+      insert and update, using row['uploaded_by'] as the source of truth.
 """
 
 import io
@@ -504,6 +512,7 @@ def ingest_candidates_batch():
     logger.info('[Ingest] Starting ingest batch')
 
     # P2: batch size 100 → 200
+    # D1: RPC now also returns uploaded_by (see migration_uploaded_by_fix.sql)
     result = supabase.rpc('claim_ingest_batch', {'p_limit': 200}).execute()
     rows   = result.data or []
 
@@ -570,6 +579,7 @@ def _ingest_one(row: Dict, existing_map: Optional[Dict] = None) -> str:
     profile      = row.get('extracted_profile') or {}
     storage_path = row.get('storage_path') or ''
     resume_text  = row.get('resume_text') or ''
+    uploaded_by  = row.get('uploaded_by')   # D1: who originally uploaded this resume file
     now          = datetime.now(timezone.utc)
 
     email = (
@@ -608,7 +618,7 @@ def _ingest_one(row: Dict, existing_map: Optional[Dict] = None) -> str:
     field_changes: List[str] = []
 
     if not existing_data:
-        data         = _build_insert_payload(profile, email, resume_url, org_id, resume_text)
+        data         = _build_insert_payload(profile, email, resume_url, org_id, resume_text, uploaded_by)
         ins          = supabase.table('hr_talent_pool').insert(data).execute()
         candidate_id = ins.data[0]['id'] if ins.data else None
         action       = 'INSERTED'
@@ -623,7 +633,7 @@ def _ingest_one(row: Dict, existing_map: Optional[Dict] = None) -> str:
 
         age_days = (now - upd_at).days
         if age_days > 30:
-            data = _build_update_payload(profile, resume_url, resume_text)
+            data = _build_update_payload(profile, resume_url, resume_text, uploaded_by)
             supabase.table('hr_talent_pool').update(data).eq('id', candidate_id).execute()
             field_changes = list(data.keys())
             action = 'UPDATED'
@@ -632,6 +642,10 @@ def _ingest_one(row: Dict, existing_map: Optional[Dict] = None) -> str:
             if not existing_data.get('resume_path') and resume_url:
                 partial['resume_path'] = resume_url
             if partial:
+                # D1: still stamp updated_by even on a partial/light-touch update,
+                # since we're writing to the row.
+                if uploaded_by:
+                    partial['updated_by'] = uploaded_by
                 supabase.table('hr_talent_pool').update(partial).eq('id', candidate_id).execute()
                 field_changes = list(partial.keys())
             action = 'SKIPPED_RECENT'
@@ -652,7 +666,8 @@ def _ingest_one(row: Dict, existing_map: Optional[Dict] = None) -> str:
 
 
 def _build_insert_payload(profile: Dict, email: str, resume_url: Optional[str],
-                           org_id: str, resume_text: str = '') -> Dict:
+                           org_id: str, resume_text: str = '',
+                           uploaded_by: Optional[str] = None) -> Dict:
     payload = {
         'candidate_name':      _name(profile),
         'email':               email,
@@ -677,12 +692,15 @@ def _build_insert_payload(profile: Dict, email: str, resume_url: Optional[str],
         'resume_text':         resume_text,
         'source_platform':     'bulk_upload',
         'organization_id':     org_id,
+        'created_by':          uploaded_by,   # D1
+        'updated_by':          uploaded_by,   # D1
     }
     return {k: v for k, v in payload.items() if k == 'resume_text' or v is not None}
 
 
 def _build_update_payload(profile: Dict, resume_url: Optional[str],
-                           resume_text: str = '') -> Dict:
+                           resume_text: str = '',
+                           uploaded_by: Optional[str] = None) -> Dict:
     payload = {
         'candidate_name':      _name(profile),
         'phone':               profile.get('phone'),
@@ -704,6 +722,7 @@ def _build_update_payload(profile: Dict, resume_url: Optional[str],
         'highest_education':   profile.get('highest_education'),
         'resume_path':         resume_url,
         'resume_text':         resume_text,
+        'updated_by':          uploaded_by,   # D1 — only updated_by on update, created_by stays as-is
     }
     return {k: v for k, v in payload.items() if k == 'resume_text' or v is not None}
 

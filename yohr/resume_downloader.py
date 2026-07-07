@@ -7,6 +7,7 @@ import logging
 import re
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 
 import requests
@@ -35,6 +36,22 @@ def _storage_path(org_id: str, session_id: str, original_url: str) -> str:
 
 
 def run_downloader() -> None:
+    # ── Reset rows stuck in "processing" for >10 min (handles worker restarts) ──
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        reset = (
+            supabase.table("org_csv_import_rows")
+            .update({"s2_status": "pending", "s2_error": "auto-reset: stuck in processing"})
+            .in_("org_id", ACTIVE_ORG_IDS)
+            .eq("s2_status", "processing")
+            .lt("updated_at", cutoff)
+            .execute()
+        )
+        if reset.data:
+            logger.info("downloader: reset %d stuck rows → pending", len(reset.data))
+    except Exception as exc:
+        logger.warning("downloader: stuck-row reset failed (non-fatal): %s", exc)
+
     try:
         rows = (
             supabase.table("org_csv_import_rows")

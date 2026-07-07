@@ -15,6 +15,7 @@ import json
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from .constants import (
@@ -316,6 +317,22 @@ def _process_row(row: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def run_ai_processor() -> None:
+    # ── Reset rows stuck in "processing" for >5 min (handles worker restarts) ──
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        reset = (
+            supabase.table("org_csv_import_rows")
+            .update({"s3_status": "pending", "s3_error": "auto-reset: stuck in processing"})
+            .in_("org_id", ACTIVE_ORG_IDS)
+            .eq("s3_status", "processing")
+            .lt("updated_at", cutoff)
+            .execute()
+        )
+        if reset.data:
+            logger.info("ai_processor: reset %d stuck rows → pending", len(reset.data))
+    except Exception as exc:
+        logger.warning("ai_processor: stuck-row reset failed (non-fatal): %s", exc)
+
     try:
         rows = (
             supabase.table("org_csv_import_rows")
