@@ -3,6 +3,18 @@ yohr/csv_parser.py
 Stage 1 — parse CSV, normalise phone/LinkedIn/name, bulk insert rows.
 Runs every 30 s via APScheduler. Processes all sessions with status='pending'.
 
+Column resolution:
+  - Target fields (name, phone, email, etc.) are matched to CSV headers by
+    NAME (normalised + alias list), not by fixed position. Any header that
+    doesn't resolve to a known target field is preserved verbatim in
+    raw_extra_fields — nothing is silently dropped.
+  - A session's org-submitted column_mapping (via submit_csv_column_mapping)
+    always takes priority over auto-resolution.
+  - If the required fields (name, and at least one of phone/email) can't be
+    confidently resolved, the session is parked as 'pending_mapping' with
+    its detected headers + best-guess partial mapping, instead of either
+    hard-failing or silently mis-mapping data.
+
 Phone normalisation:
   - Detects Excel scientific notation (9.19767E+11) and converts best-effort
   - Uses phonenumbers lib with country hint from location field
@@ -65,6 +77,48 @@ NULL_MARKERS = {" - ", "-", "- ", " -", "n/a", "na", "nil", "none", "null", ""}
 
 # Singleton country_converter (avoids reloading 3 MB CSV on every call)
 _CC = coco.CountryConverter()
+
+# ── Column resolution: header aliases per target field ───────────────────────
+# Order doesn't matter for matching (each header can match at most one
+# target); listed roughly in CSV-appearance order for readability.
+COLUMN_ALIASES: dict[str, list[str]] = {
+    "name":        ["name", "candidate", "candidatename", "fullname"],
+    "designation": ["designation", "title", "jobtitle", "role", "currentdesignation"],
+    "company":     ["company", "currentcompany", "employer", "organisation", "organization"],
+    "notice":      ["notice", "noticeperiod", "noticedays"],
+    "location":    ["location", "city", "currentlocation", "candidatelocation"],
+    "phone":       ["phone", "mobile", "contact", "tel", "cell", "phonenumber", "mobilenumber", "contactnumber"],
+    "email":       ["email", "mail", "emailaddress", "emailid"],
+    "resume":      ["resume", "cv", "resumeurl", "cvurl", "resumelink"],
+    "linkedin":    ["linkedin", "linkedinurl", "linkedinprofile"],
+}
+
+
+def _normalize_header(header: str) -> str:
+    return re.sub(r'[^a-z0-9]', '', (header or "").strip().lower())
+
+
+def resolve_columns(all_headers: list[str]) -> dict[str, str]:
+    """
+    Match each target field to a real CSV header by name (normalised +
+    alias list), independent of column order. Each header is consumed by
+    at most one target field. Returns {target_field: actual_header}.
+    """
+    normalized = {h: _normalize_header(h) for h in all_headers}
+    resolved: dict[str, str] = {}
+    used_headers: set[str] = set()
+
+    for target, aliases in COLUMN_ALIASES.items():
+        alias_set = set(aliases)
+        for header in all_headers:
+            if header in used_headers:
+                continue
+            if normalized[header] in alias_set:
+                resolved[target] = header
+                used_headers.add(header)
+                break
+
+    return resolved
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -210,7 +264,8 @@ def run_csv_parser() -> None:
     try:
         sessions = (
             supabase.table("org_csv_import_sessions")
-            .select("id, file_storage_path, filename, org_id")
+            .select("id, file_storage_path, filename, org_id, column_mapping, "
+                    "ai_processing_enabled, resume_download_enabled")
             .in_("org_id", ACTIVE_ORG_IDS)
             .eq("status", "pending")
             .execute()
@@ -225,9 +280,15 @@ def run_csv_parser() -> None:
 
 
 def _process_session(session: dict) -> None:
-    session_id   = session["id"]
-    org_id       = session["org_id"]
-    storage_path = session["file_storage_path"]
+    session_id     = session["id"]
+    org_id         = session["org_id"]
+    storage_path   = session["file_storage_path"]
+    existing_mapping = session.get("column_mapping")
+    ai_enabled     = session.get("ai_processing_enabled")
+    ai_enabled     = True if ai_enabled is None else ai_enabled
+    resume_enabled = session.get("resume_download_enabled")
+    resume_enabled = True if resume_enabled is None else resume_enabled
+
     logger.info("csv_parser: starting session %s (%s)", session_id, session["filename"])
 
     from .constants import STORAGE_BUCKET
@@ -247,13 +308,31 @@ def _process_session(session: dict) -> None:
         return
 
     try:
-        reader        = csv.DictReader(io.StringIO(csv_text))
-        all_headers   = reader.fieldnames or []
-        extra_headers = all_headers[10:]   # cols 11+ are screening questions
+        reader      = csv.DictReader(io.StringIO(csv_text))
+        all_headers = reader.fieldnames or []
+
+        resolved = existing_mapping or resolve_columns(all_headers)
+
+        if "name" not in resolved or ("phone" not in resolved and "email" not in resolved):
+            supabase.table("org_csv_import_sessions").update({
+                "status":           "pending_mapping",
+                "detected_headers": all_headers,
+                "column_mapping":   resolved,
+            }).eq("id", session_id).execute()
+            logger.info(
+                "csv_parser: session %s needs manual column mapping (resolved=%s)",
+                session_id, resolved,
+            )
+            return
+
+        mapped_headers = set(resolved.values())
 
         rows_to_insert = []
         for row_num, raw_row in enumerate(reader, start=1):
-            record = _build_row_record(session_id, org_id, row_num, raw_row, extra_headers)
+            record = _build_row_record(
+                session_id, org_id, row_num, raw_row,
+                resolved, mapped_headers, ai_enabled, resume_enabled,
+            )
             rows_to_insert.append(record)
 
         if not rows_to_insert:
@@ -281,20 +360,29 @@ def _build_row_record(
     org_id: str,
     row_num: int,
     raw: dict,
-    extra_headers: list,
+    resolved: dict[str, str],
+    mapped_headers: set[str],
+    ai_processing_enabled: bool,
+    resume_download_enabled: bool,
 ) -> dict:
-    raw_name       = clean_null(raw.get("name", "")) or ""
-    raw_email      = clean_null(raw.get("email", ""))
-    raw_phone_str  = clean_null(raw.get("phone", "")) or ""
-    raw_location   = clean_null(raw.get("location", "")) or ""
-    raw_linkedin   = clean_null(raw.get("linkedin", ""))
-    raw_resume_url = clean_null(raw.get("resume", ""))
+    def field(target: str) -> str:
+        header = resolved.get(target)
+        return raw.get(header, "") if header else ""
+
+    raw_name       = clean_null(field("name")) or ""
+    raw_email      = clean_null(field("email"))
+    raw_phone_str  = clean_null(field("phone")) or ""
+    raw_location   = clean_null(field("location")) or ""
+    raw_linkedin   = clean_null(field("linkedin"))
+    raw_resume_url = clean_null(field("resume"))
 
     if not raw_email:
         return {
             "session_id": session_id, "row_number": row_num,
             "org_id": org_id, "raw_name": raw_name, "raw_email": None,
             "s1_status": "failed", "s1_error": "Missing email — row skipped",
+            "ai_processing_enabled": ai_processing_enabled,
+            "resume_download_enabled": resume_download_enabled,
         }
 
     # Phone: normalise + preserve raw original for ingestor
@@ -305,35 +393,42 @@ def _build_row_record(
     first_name, last_name = split_name(raw_name)
     linkedin_clean        = normalise_linkedin(raw_linkedin)
 
-    # Extra screening question columns (col 11+)
+    # Any header not resolved to a known target field is preserved verbatim —
+    # e.g. current_ctc, expected_ctc, experience, source, gender, degrees,
+    # colleges, github_url, portfolio_link, social_media, other_links.
     extra_fields: dict = {}
-    for hdr in extra_headers:
-        val = clean_null(raw.get(hdr, ""))
-        if val:
-            extra_fields[hdr] = val
+    for header, val in raw.items():
+        if header is None or header in mapped_headers:
+            continue
+        cleaned = clean_null(val)
+        if cleaned:
+            extra_fields[header] = cleaned
     # Tag the raw phone original for ingestor to put in other_details
     if phone_raw_original and phone_raw_original != phone_e164:
         extra_fields["_raw_phone_csv"] = phone_raw_original
 
     return {
-        "session_id":           session_id,
-        "row_number":           row_num,
-        "org_id":               org_id,
-        "raw_name":             raw_name or None,
-        "raw_designation":      clean_null(raw.get("designation", "")),
-        "raw_company":          clean_null(raw.get("company", "")),
-        "raw_notice":           clean_null(raw.get("notice", "")),
-        "raw_location":         raw_location or None,
-        "raw_phone":            raw_phone_str or None,
-        "raw_email":            raw_email,
-        "raw_resume_url":       raw_resume_url,
-        "raw_linkedin":         raw_linkedin,
-        "raw_extra_fields":     extra_fields,
-        "s1_status":            "done",
-        "parsed_first_name":    first_name or None,
-        "parsed_last_name":     last_name or None,
-        "parsed_phone":         phone_e164,
-        "parsed_phone_country": phone_country,
-        "parsed_linkedin":      linkedin_clean,
-        "s2_status":            "pending" if raw_resume_url else "skipped",
+        "session_id":              session_id,
+        "row_number":              row_num,
+        "org_id":                  org_id,
+        "raw_name":                raw_name or None,
+        "raw_designation":         clean_null(field("designation")),
+        "raw_company":             clean_null(field("company")),
+        "raw_notice":              clean_null(field("notice")),
+        "raw_location":            raw_location or None,
+        "raw_phone":               raw_phone_str or None,
+        "raw_email":               raw_email,
+        "raw_resume_url":          raw_resume_url,
+        "raw_linkedin":            raw_linkedin,
+        "raw_extra_fields":        extra_fields,
+        "s1_status":               "done",
+        "parsed_first_name":       first_name or None,
+        "parsed_last_name":        last_name or None,
+        "parsed_phone":            phone_e164,
+        "parsed_phone_country":    phone_country,
+        "parsed_linkedin":         linkedin_clean,
+        "s2_status":               "pending" if (raw_resume_url and resume_download_enabled) else "skipped",
+        "s3_status":               "pending" if ai_processing_enabled else "skipped",
+        "ai_processing_enabled":   ai_processing_enabled,
+        "resume_download_enabled": resume_download_enabled,
     }
