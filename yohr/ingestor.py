@@ -56,20 +56,38 @@ def _safe_str(value: Any) -> Optional[str]:
     return s or None
 
 
+def _parse_ctc_numeric(value: Any) -> Optional[float]:
+    """'3,300,000' / '3300000.50' / '₹33L' (digits only) → 3300000.0. None if unparsable."""
+    if value is None:
+        return None
+    digits = re.sub(r'[^\d.]', '', str(value))
+    if not digits:
+        return None
+    try:
+        return float(digits)
+    except ValueError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Record builder
 # ---------------------------------------------------------------------------
 
-def _build_talent_record(row: dict) -> tuple[Optional[dict], list[str]]:
+def _build_talent_record(row: dict, created_by: Optional[str] = None) -> tuple[Optional[dict], list[str]]:
     """
     Build a single hr_talent_pool upsert record from an org_csv_import_row.
     Returns (record_dict, skill_list) or (None, []) if no email.
+
+    created_by is the org_csv_import_sessions.created_by (the employee who
+    uploaded the CSV) — passed in by the caller since it lives on the
+    session, not the row.
     """
     email = (row.get("raw_email") or "").strip().lower()
     if not email:
         return None, []
 
     ai: dict = row.get("ai_result") or {}
+    extra: dict = row.get("raw_extra_fields") or {}
 
     # ── Skills (JSONB arrays) ────────────────────────────────────────────
     skills: list = [s for s in (ai.get("top_skills") or []) if isinstance(s, str)]
@@ -118,7 +136,7 @@ def _build_talent_record(row: dict) -> tuple[Optional[dict], list[str]]:
     }
     # Preserve raw CSV phone — important when Excel sci notation truncated digits
     # e.g. actual 919766748078 was saved as "9.19767E+11" in CSV
-    raw_phone_csv = (row.get("raw_extra_fields") or {}).get("_raw_phone_csv") or row.get("raw_phone")
+    raw_phone_csv = extra.get("_raw_phone_csv") or row.get("raw_phone")
     if raw_phone_csv:
         other_details["raw_phone"] = raw_phone_csv
     if isinstance(ai_other, dict):
@@ -132,6 +150,7 @@ def _build_talent_record(row: dict) -> tuple[Optional[dict], list[str]]:
         "email":           email,
         "organization_id": row.get("org_id") or YOHR_ORG_ID,
         "candidate_name":  _safe_str(row.get("raw_name")) or _safe_str(ai.get("candidate_name")),
+        "created_by":      created_by,
 
         # Contact
         # Phone: prefer AI-extracted (from actual PDF — correct even when CSV had sci notation)
@@ -147,6 +166,13 @@ def _build_talent_record(row: dict) -> tuple[Optional[dict], list[str]]:
         "notice_period":       notice_text,
         "suggested_title":     _safe_str(ai.get("suggested_title")),
         "total_experience":    _safe_str(ai.get("total_experience")),
+
+        # CTC — CSV-only (AI doesn't extract these); current_ctc/expected_ctc
+        # come through raw_extra_fields since they're not fixed raw_* columns
+        "current_salary":      _safe_str(extra.get("current_ctc")),
+        "expected_salary":     _safe_str(extra.get("expected_ctc")),
+        "parsed_current_ctc":  _parse_ctc_numeric(extra.get("current_ctc")),
+        "parsed_expected_ctc": _parse_ctc_numeric(extra.get("expected_ctc")),
 
         # Resume content
         "resume_path":           _to_url(row.get("stored_resume_path")),
@@ -272,12 +298,29 @@ def run_ingestor() -> None:
 
     logger.info("ingestor: upserting %d rows", len(rows))
 
+    # created_by lives on the session (the uploader), not the row — fetch it
+    # once per distinct session in this batch rather than per row.
+    session_ids_in_batch = {r["session_id"] for r in rows}
+    session_created_by: dict = {}
+    try:
+        session_rows = (
+            supabase.table("org_csv_import_sessions")
+            .select("id, created_by")
+            .in_("id", list(session_ids_in_batch))
+            .execute()
+            .data
+        )
+        session_created_by = {s["id"]: s.get("created_by") for s in (session_rows or [])}
+    except Exception as exc:
+        logger.warning("ingestor: failed to fetch session created_by (non-fatal): %s", exc)
+
     talent_records: list[dict] = []
     row_id_map:     dict       = {}
     all_skills:     set[str]   = set()
 
     for row in rows:
-        record, skills = _build_talent_record(row)
+        created_by = session_created_by.get(row["session_id"])
+        record, skills = _build_talent_record(row, created_by=created_by)
         if record:
             talent_records.append(record)
             row_id_map[row["id"]] = record
