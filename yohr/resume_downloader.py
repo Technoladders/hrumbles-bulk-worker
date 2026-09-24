@@ -36,14 +36,18 @@ def _storage_path(org_id: str, session_id: str, original_url: str) -> str:
 
 
 def run_downloader() -> None:
-    # ── Reset rows stuck in "processing" for >10 min (handles worker restarts) ──
+    # ── Reset rows stuck in "downloading" for >10 min (handles worker restarts) ──
+    # NOTE: this previously checked s2_status == "processing", a value
+    # _download_row never actually sets (it sets "downloading") and that
+    # isn't even in org_csv_import_rows' s2_status CHECK constraint — so this
+    # reset never matched anything. Fixed to check the real in-progress value.
     try:
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
         reset = (
             supabase.table("org_csv_import_rows")
-            .update({"s2_status": "pending", "s2_error": "auto-reset: stuck in processing"})
+            .update({"s2_status": "pending", "s2_error": "auto-reset: stuck in downloading"})
             .in_("org_id", ACTIVE_ORG_IDS)
-            .eq("s2_status", "processing")
+            .eq("s2_status", "downloading")
             .lt("updated_at", cutoff)
             .execute()
         )
