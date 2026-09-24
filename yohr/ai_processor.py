@@ -21,8 +21,9 @@ from pathlib import Path
 from .constants import (
     supabase, openai_client, ACTIVE_ORG_IDS,
     STORAGE_BUCKET,
-    OPENAI_MODEL, MAX_AI_TOKENS, MAX_AI_INPUT_CHARS,
+    AI_MODEL, MAX_AI_TOKENS, MAX_AI_INPUT_CHARS,
     MAX_AI_WORKERS, MAX_AI_RETRIES,
+    AI_PROVIDER, OLLAMA_NUM_CTX,
 )
 
 logger = logging.getLogger(__name__)
@@ -215,12 +216,21 @@ def _extract_text(storage_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _call_ai(full_text: str) -> dict:
-    """Send compressed resume text to GPT and parse structured JSON response."""
+    """
+    Send compressed resume text to the configured AI provider and parse the
+    structured JSON response.
+
+    AI_PROVIDER selects OpenAI (default, production) or a local Ollama server
+    (AI_PROVIDER=ollama, local dev) — both go through this same
+    OpenAI-compatible chat-completions call; only the client's base_url and
+    model name differ (see config.py / constants.py). The call shape itself
+    is unchanged from before the provider switch was introduced.
+    """
     compressed = _compress(full_text)
     ai_input = compressed[:MAX_AI_INPUT_CHARS]
 
-    response = openai_client.chat.completions.create(
-        model=OPENAI_MODEL,
+    request_kwargs: dict = dict(
+        model=AI_MODEL,
         max_tokens=MAX_AI_TOKENS,
         temperature=0,
         messages=[
@@ -228,6 +238,14 @@ def _call_ai(full_text: str) -> dict:
             {"role": "user",   "content": ai_input},
         ],
     )
+    if AI_PROVIDER == "ollama":
+        # Ollama-specific: raise its (much smaller) default context window so
+        # the existing MAX_AI_INPUT_CHARS + MAX_AI_TOKENS budget is never
+        # silently truncated. Only sent when AI_PROVIDER=ollama, so
+        # production's OpenAI request body is byte-for-byte unchanged.
+        request_kwargs["extra_body"] = {"options": {"num_ctx": OLLAMA_NUM_CTX}}
+
+    response = openai_client.chat.completions.create(**request_kwargs)
     raw = (response.choices[0].message.content or "").strip()
 
     # Strip markdown fences if present
