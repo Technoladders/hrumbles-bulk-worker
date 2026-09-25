@@ -17,6 +17,7 @@ def register_yohr_jobs(scheduler) -> None:
     from .resume_downloader import run_downloader
     from .ai_processor      import run_ai_processor
     from .ingestor          import run_ingestor
+    from .ai_backfill       import run_ai_backfill
 
     scheduler.add_job(
         func=_safe(run_csv_parser),
@@ -46,7 +47,18 @@ def register_yohr_jobs(scheduler) -> None:
         max_instances=1,
         replace_existing=True,
     )
-    logger.info("YOHR: all 4 pipeline jobs registered")
+    # Deferred AI backfill — separate schedule, gated by yohr_ai_processing_config
+    # (superadmin-editable, not env-driven). No urgency: this is a background
+    # enrichment pass over rows already ingested without AI, not the primary
+    # pipeline, so a slower interval is fine.
+    scheduler.add_job(
+        func=_safe(run_ai_backfill),
+        trigger="interval", seconds=60,
+        id="yohr_ai_backfill",
+        max_instances=1,
+        replace_existing=True,
+    )
+    logger.info("YOHR: all 4 pipeline jobs + AI backfill registered")
 
 
 def _safe(fn):

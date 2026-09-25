@@ -13,6 +13,16 @@ SUPABASE_URL        = os.environ['SUPABASE_URL']
 SUPABASE_SERVICE_KEY = os.environ['SUPABASE_SERVICE_KEY']
 OPENAI_API_KEY      = os.environ['OPENAI_API_KEY']
 
+# Separate OpenAI key for the YOHR AI-backfill stage only (see
+# yohr/ai_backfill.py). Unset -> falls back to the same OPENAI_API_KEY above,
+# so nothing changes until this is actually configured. Deliberately a SECOND,
+# independent client (yohr_ai_client below), never a reconfiguration of the
+# shared openai_client: bulk_tasks.py imports that shared client for its own
+# unrelated OpenAI Batch API calls (files.create/batches.create/etc.), which
+# would silently break if openai_client were ever repointed at a different
+# key/provider for YOHR's sake.
+YOHR_OPENAI_API_KEY = os.getenv('YOHR_OPENAI_API_KEY', '')
+
 # ── Optional env vars with defaults ──────────────────────────────────────────
 REDIS_HOST          = os.getenv('REDIS_HOST', 'redis')
 REDIS_PORT          = int(os.getenv('REDIS_PORT', 6379))
@@ -26,6 +36,7 @@ BULK_QUEUE_NAME     = 'bulk-pipeline'
 # ── Clients (module-level singletons) ────────────────────────────────────────
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 openai_client    = OpenAI(api_key=OPENAI_API_KEY)
+yohr_ai_client   = OpenAI(api_key=YOHR_OPENAI_API_KEY or OPENAI_API_KEY)
 redis_conn       = Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
 bulk_queue       = Queue(BULK_QUEUE_NAME, connection=redis_conn)
 

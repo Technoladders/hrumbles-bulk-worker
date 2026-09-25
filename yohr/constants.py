@@ -3,7 +3,7 @@ yohr/constants.py — YOHR pipeline constants.
 Imports shared clients from ROOT config.py.
 """
 import os
-from config import supabase, openai_client, STORAGE_BUCKET  # noqa: F401
+from config import supabase, openai_client, yohr_ai_client, STORAGE_BUCKET  # noqa: F401
 
 YOHR_ORG_ID    = "2e569073-86de-4199-9d36-99dfe4d2e8f6"
 # Demo org used for testing — remove from this list when going live

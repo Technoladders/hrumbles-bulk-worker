@@ -19,7 +19,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from .constants import (
-    supabase, openai_client, ACTIVE_ORG_IDS,
+    supabase, yohr_ai_client, ACTIVE_ORG_IDS,
     STORAGE_BUCKET,
     OPENAI_MODEL, MAX_AI_TOKENS, MAX_AI_INPUT_CHARS,
     MAX_AI_WORKERS, MAX_AI_RETRIES,
@@ -214,12 +214,18 @@ def _extract_text(storage_path: str) -> str:
 # AI call
 # ---------------------------------------------------------------------------
 
-def _call_ai(full_text: str) -> dict:
-    """Send compressed resume text to GPT and parse structured JSON response."""
+def _call_ai_raw(full_text: str, client) -> tuple[dict, int]:
+    """
+    Send compressed resume text to GPT via the given client and parse the
+    structured JSON response. Returns (result_dict, total_tokens_used) so
+    callers that need to track usage (e.g. yohr/ai_backfill.py's daily
+    budget) can, without changing what _call_ai() below returns to its
+    existing callers.
+    """
     compressed = _compress(full_text)
     ai_input = compressed[:MAX_AI_INPUT_CHARS]
 
-    response = openai_client.chat.completions.create(
+    response = client.chat.completions.create(
         model=OPENAI_MODEL,
         max_tokens=MAX_AI_TOKENS,
         temperature=0,
@@ -229,6 +235,7 @@ def _call_ai(full_text: str) -> dict:
         ],
     )
     raw = (response.choices[0].message.content or "").strip()
+    total_tokens = getattr(getattr(response, "usage", None), "total_tokens", 0) or 0
 
     # Strip markdown fences if present
     if raw.startswith("```"):
@@ -253,6 +260,17 @@ def _call_ai(full_text: str) -> dict:
         if not isinstance(result.get(list_key), list):
             result[list_key] = []
 
+    return result, total_tokens
+
+
+def _call_ai(full_text: str) -> dict:
+    """Send compressed resume text to GPT and parse structured JSON response.
+
+    Unchanged external contract (same input, same output) — internals now
+    delegate to _call_ai_raw so the token-usage-tracking path in
+    yohr/ai_backfill.py can share this logic instead of duplicating it.
+    """
+    result, _tokens = _call_ai_raw(full_text, yohr_ai_client)
     return result
 
 
