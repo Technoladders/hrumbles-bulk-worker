@@ -292,22 +292,32 @@ def _process_session(session: dict) -> None:
 
     from .constants import STORAGE_BUCKET
 
-    # How many rows this session already has -- 0 on a first attempt, >0 when
-    # resuming a large file (or retrying after a batch failure) across
-    # multiple ticks. The CSV is always re-read from the start (no seekable
-    # cursor is persisted), but rows up to this count are skipped rather than
-    # re-inserted, so a transient mid-file failure only ever costs re-reading
-    # the file, never re-writing or losing already-committed rows.
+    # Resume point: the highest row_number already committed for this session
+    # -- 0 on a first attempt, >0 when resuming a large file (or retrying
+    # after a batch failure) across multiple ticks. Batches are inserted in
+    # file order and a failed batch stops the tick, so rows 1..max are all
+    # present. The CSV is always re-read from the start (no seekable cursor is
+    # persisted), but rows up to this point are skipped rather than
+    # re-inserted.
+    #
+    # NOTE: this used to be select(count="exact", head=True).count, which
+    # returns 0 with our postgrest version -- every tick restarted at row 1,
+    # re-inserting the first MAX_CSV_ROWS_PER_TICK rows forever and never
+    # reaching the rest of the file. Reading max(row_number) avoids relying
+    # on count headers at all.
     try:
-        already_inserted = (
+        last_row = (
             supabase.table("org_csv_import_rows")
-            .select("id", count="exact", head=True)
+            .select("row_number")
             .eq("session_id", session_id)
+            .order("row_number", desc=True)
+            .limit(1)
             .execute()
-            .count
-        ) or 0
+            .data
+        )
+        already_inserted = int(last_row[0]["row_number"]) if last_row else 0
     except Exception as exc:
-        logger.error("csv_parser: row-count check failed for session %s: %s", session_id, exc)
+        logger.error("csv_parser: resume-point check failed for session %s: %s", session_id, exc)
         return
 
     logger.info(
@@ -324,6 +334,15 @@ def _process_session(session: dict) -> None:
         csv_bytes: bytes = supabase.storage.from_(STORAGE_BUCKET).download(storage_path)
         csv_text = csv_bytes.decode("utf-8-sig")
     except Exception as exc:
+        if already_inserted:
+            # Mid-file resume: a transient storage/HTTP error must not mark the
+            # file complete (that silently dropped every remaining row). Leave
+            # it for the next tick.
+            logger.warning(
+                "csv_parser: storage download failed for session %s while resuming at row %d "
+                "— will retry next tick: %s", session_id, already_inserted, exc,
+            )
+            return
         logger.error("csv_parser: storage download failed for session %s: %s", session_id, exc)
         supabase.table("org_csv_import_sessions").update(
             {"status": "failed", "s1_complete": True, "error_summary": f"CSV download failed: {exc}"}
@@ -379,8 +398,15 @@ def _process_session(session: dict) -> None:
             ).eq("id", session_id).execute()
             return
 
+        # Idempotent insert: a (session_id, row_number) that already exists is
+        # skipped, so a wrong resume point can never create duplicate rows.
+        # Requires the unique index in migrations/20260929_org_csv_import_rows_unique.sql.
         for i in range(0, len(rows_to_insert), 200):
-            supabase.table("org_csv_import_rows").insert(rows_to_insert[i:i + 200]).execute()
+            supabase.table("org_csv_import_rows").upsert(
+                rows_to_insert[i:i + 200],
+                on_conflict="session_id,row_number",
+                ignore_duplicates=True,
+            ).execute()
 
         if reader_exhausted:
             supabase.table("org_csv_import_sessions").update(
@@ -399,8 +425,8 @@ def _process_session(session: dict) -> None:
         # here -- this is the fix for the bug where a single transient error
         # (e.g. an HTTP/2 ConnectionTerminated mid-batch) silently truncated
         # the rest of the file. Whatever batches already committed THIS tick
-        # stay committed; the next tick's already_inserted count picks up
-        # from exactly there.
+        # stay committed; the next tick's resume point (max row_number) picks
+        # up from exactly there.
         logger.warning(
             "csv_parser: batch failed for session %s (%d row(s) already inserted before "
             "this tick) — will resume from there next tick: %s",

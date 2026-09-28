@@ -50,12 +50,17 @@ class _FakeQuery:
         self._execute_fn = execute_fn
 
     def select(self, *a, **k):
+        self._execute_fn.select_cols = a[0] if a else "*"
+        self._execute_fn.head = k.get("head", False)
         return self
 
     def eq(self, *a, **k):
         return self
 
     def in_(self, *a, **k):
+        return self
+
+    def order(self, *a, **k):
         return self
 
     def limit(self, *a, **k):
@@ -69,12 +74,24 @@ class _FakeQuery:
         self._execute_fn.insert_rows = rows
         return self
 
+    def upsert(self, rows, on_conflict=None, ignore_duplicates=False):
+        self._execute_fn.insert_rows = rows
+        self._execute_fn.ignore_duplicates = ignore_duplicates
+        return self
+
     def execute(self):
         return self._execute_fn()
 
 
 class FakeSupabase:
-    """Tracks org_csv_import_rows (a list) and one session dict, in memory."""
+    """Tracks org_csv_import_rows (a list) and one session dict, in memory.
+
+    Mirrors two production behaviours the parser must cope with:
+      * select(count="exact", head=True).count is 0 (our postgrest version
+        doesn't populate it) -- the root cause of the duplicate-rows bug.
+      * upsert(..., ignore_duplicates=True) against the unique
+        (session_id, row_number) index skips rows that already exist.
+    """
 
     def __init__(self, csv_bytes: bytes):
         self.rows = []
@@ -82,6 +99,7 @@ class FakeSupabase:
         self._csv_bytes = csv_bytes
         self.insert_calls = 0
         self.fail_on_insert_call = None  # set to an int to simulate a mid-loop crash
+        self.fail_download = False
         self.rpc_calls = []
 
         class _Storage:
@@ -89,6 +107,8 @@ class FakeSupabase:
                 return inner_self
 
             def download(inner_self, path):
+                if self.fail_download:
+                    raise RuntimeError("cannot access local variable 'response'")
                 return self._csv_bytes
 
         self.storage = _Storage()
@@ -99,17 +119,30 @@ class FakeSupabase:
         class _Ctx:
             insert_rows = None
             update_payload = None
+            ignore_duplicates = False
+            select_cols = "*"
+            head = False
 
             def __call__(inner_self):
                 if name == "org_csv_import_rows" and inner_self.insert_rows is not None:
                     outer.insert_calls += 1
                     if outer.fail_on_insert_call == outer.insert_calls:
                         raise RuntimeError("simulated ConnectionTerminated")
-                    outer.rows.extend(inner_self.insert_rows)
+                    existing = {(r["session_id"], r["row_number"]) for r in outer.rows}
+                    for r in inner_self.insert_rows:
+                        key = (r["session_id"], r["row_number"])
+                        if inner_self.ignore_duplicates and key in existing:
+                            continue
+                        outer.rows.append(r)
+                        existing.add(key)
                     return _FakeResult(data=inner_self.insert_rows)
-                if name == "org_csv_import_rows" and inner_self.update_payload is None and inner_self.insert_rows is None:
-                    # count query
-                    return _FakeResult(count=len(outer.rows))
+                if name == "org_csv_import_rows" and inner_self.update_payload is None:
+                    if inner_self.head:
+                        return _FakeResult(data=[], count=0)  # production behaviour
+                    if inner_self.select_cols == "row_number":
+                        top = max((r["row_number"] for r in outer.rows), default=None)
+                        return _FakeResult(data=[] if top is None else [{"row_number": top}])
+                    return _FakeResult(data=[], count=len(outer.rows))
                 if name == "org_csv_import_sessions" and inner_self.update_payload is not None:
                     outer.session.update(inner_self.update_payload)
                     return _FakeResult(data=[outer.session])
@@ -186,6 +219,43 @@ class TestResumableCsvParsing(unittest.TestCase):
             csv_parser._process_session(dict(SESSION_ROW))
         self.assertEqual(fake.session.get("status"), "failed")
         self.assertTrue(fake.session["s1_complete"])
+
+    def test_rerunning_a_finished_session_adds_no_duplicates(self):
+        fake = FakeSupabase(_make_csv(300))
+        with patch.object(csv_parser, "supabase", fake):
+            csv_parser._process_session(dict(SESSION_ROW))
+            csv_parser._process_session(dict(SESSION_ROW))
+            csv_parser._process_session(dict(SESSION_ROW))
+        self.assertEqual(len(fake.rows), 300)
+        self.assertEqual(len({r["row_number"] for r in fake.rows}), 300)
+
+    def test_large_file_is_fully_read_across_ticks_without_duplicates(self):
+        from yohr.constants import MAX_CSV_ROWS_PER_TICK
+        total_rows = MAX_CSV_ROWS_PER_TICK * 3 + 7
+        fake = FakeSupabase(_make_csv(total_rows))
+        with patch.object(csv_parser, "supabase", fake):
+            for _ in range(6):
+                if fake.session["s1_complete"]:
+                    break
+                csv_parser._process_session(dict(SESSION_ROW))
+        self.assertTrue(fake.session["s1_complete"])
+        self.assertEqual(len(fake.rows), total_rows)
+        self.assertEqual(max(r["row_number"] for r in fake.rows), total_rows)
+
+    def test_download_failure_while_resuming_does_not_truncate_file(self):
+        from yohr.constants import MAX_CSV_ROWS_PER_TICK
+        total_rows = MAX_CSV_ROWS_PER_TICK + 50
+        fake = FakeSupabase(_make_csv(total_rows))
+        with patch.object(csv_parser, "supabase", fake):
+            csv_parser._process_session(dict(SESSION_ROW))
+            fake.fail_download = True
+            csv_parser._process_session(dict(SESSION_ROW))
+            self.assertFalse(fake.session["s1_complete"])
+            self.assertNotEqual(fake.session.get("status"), "failed")
+            fake.fail_download = False
+            csv_parser._process_session(dict(SESSION_ROW))
+        self.assertTrue(fake.session["s1_complete"])
+        self.assertEqual(len(fake.rows), total_rows)
 
 
 if __name__ == "__main__":
