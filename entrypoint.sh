@@ -31,10 +31,15 @@ echo ">>> Starting RQ worker watchdog..."
   set +e  # ← CRITICAL FIX: stops set -e from killing the loop on worker exit
   while true; do
     echo ">>> [Watchdog] Starting RQ worker..."
+    # --max-jobs lowered from 200: this container is capped at 512MiB, and
+    # some jobs (e.g. bulk_tasks.poll_ai_batches loading a full Batch-API
+    # output file) can leave the process holding fragmented/unreleased
+    # memory afterward. Recycling the worker process more often bounds how
+    # much of that can accumulate before a clean restart.
     rq worker bulk-pipeline \
       --url "$REDIS_URL" \
       --name "bulk-worker-$(hostname)" \
-      --max-jobs 200 \
+      --max-jobs 50 \
       2>&1
     EXIT_CODE=$?
     echo ">>> [Watchdog] RQ worker exited (code: $EXIT_CODE). Restarting in 5s..."

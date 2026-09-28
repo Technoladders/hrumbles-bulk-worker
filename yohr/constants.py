@@ -33,8 +33,12 @@ MAX_AI_TOKENS      = 4096
 # Characters sent to AI after compression — covers even 5-page resumes
 MAX_AI_INPUT_CHARS = 20_000
 
-MAX_AI_WORKERS       = 5
-MAX_DOWNLOAD_WORKERS = 8
+# Lowered from 5/8: this container is capped at 512MiB total, shared with
+# the separate RQ worker process (bulk_tasks.py) and this same process's
+# other concurrent stages (S2 downloads, ai_backfill). Fewer concurrent
+# threads here reduces this process's peak share of that shared ceiling.
+MAX_AI_WORKERS       = 2
+MAX_DOWNLOAD_WORKERS = 4
 MAX_DOWNLOAD_RETRIES = 3
 DOWNLOAD_TIMEOUT     = 30
 MAX_AI_RETRIES       = 2

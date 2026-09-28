@@ -11,88 +11,36 @@ it entirely.
 
 Deliberately a separate module from ai_processor.py (Stage 3's normal,
 immediate path for ai_processing_enabled=true rows) so that stage's existing
-behavior is completely untouched by this one. The two share the request/
-parsing logic via ai_processor._call_ai_raw, not duplicated here, but this
-module owns its own row-selection query, its own client (yohr_ai_client —
-see config.py's isolation note), and the one behavior that makes this a
-"backfill" and not just a delayed first attempt: on success, it resets
-s4_status back to 'pending' so the existing ingestor.run_ingestor() naturally
-re-upserts (on_conflict="email,organization_id") and UPDATES the
-already-ingested hr_talent_pool row with the newly-enriched fields, rather
-than ever touching hr_talent_pool directly from here.
+per-row behavior is untouched by this one. The two share the request/parsing
+logic via ai_processor._call_ai_raw, and now also share the budget
+check/accounting logic via ai_budget.py (get_budget_status/record_usage),
+so yohr_ai_daily_usage reflects total YOHR AI consumption from both paths,
+not just this one. This module still owns its own row-selection query, its
+own client (yohr_ai_client — see config.py's isolation note), and the one
+behavior that makes this a "backfill" and not just a delayed first attempt:
+on success, it resets s4_status back to 'pending' so the existing
+ingestor.run_ingestor() naturally re-upserts (on_conflict=
+"email,organization_id") and UPDATES the already-ingested hr_talent_pool row
+with the newly-enriched fields, rather than ever touching hr_talent_pool
+directly from here.
 
 Timezone: "daily" and "active hours" are both interpreted in IST
 (Asia/Kolkata, UTC+5:30, no DST) — confirmed with the org, since that's YO HR
 Consultancy's own locale. All timestamptz columns are still stored/compared
 in UTC as usual; only the *day boundary* and *hour-of-day* comparisons here
-are done in IST.
+are done in IST (see ai_budget.py).
 """
 import logging
-from datetime import datetime, timedelta, timezone
 
 from .constants import supabase, yohr_ai_client, YOHR_ORG_ID
 from .ai_processor import _call_ai_raw, _extract_text, _sanitize
+from .ai_budget import get_budget_status, record_usage
 
 logger = logging.getLogger(__name__)
-
-IST = timezone(timedelta(hours=5, minutes=30))
 
 # Small batch per tick — this is a background enrichment pass, not the
 # primary pipeline; no need to race through the whole backlog in one go.
 BATCH_SIZE = 20
-
-
-def _current_ist() -> datetime:
-    return datetime.now(timezone.utc).astimezone(IST)
-
-
-def _load_config(org_id: str) -> dict | None:
-    rows = (
-        supabase.table("yohr_ai_processing_config")
-        .select("*")
-        .eq("organization_id", org_id)
-        .limit(1)
-        .execute()
-        .data
-    )
-    return rows[0] if rows else None
-
-
-def _in_active_window(cfg: dict, now_ist: datetime) -> bool:
-    start_h = cfg.get("active_hours_start")
-    end_h = cfg.get("active_hours_end")
-    if start_h is None or end_h is None:
-        return True  # no restriction configured
-    hour = now_ist.hour
-    if start_h <= end_h:
-        return start_h <= hour < end_h
-    return hour >= start_h or hour < end_h  # wraps past midnight, e.g. 22 -> 6
-
-
-def _get_or_create_usage_row(org_id: str, usage_date: str) -> dict:
-    existing = (
-        supabase.table("yohr_ai_daily_usage")
-        .select("*")
-        .eq("organization_id", org_id)
-        .eq("usage_date", usage_date)
-        .limit(1)
-        .execute()
-        .data
-    )
-    if existing:
-        return existing[0]
-    inserted = (
-        supabase.table("yohr_ai_daily_usage")
-        .insert({
-            "organization_id": org_id,
-            "usage_date": usage_date,
-            "tokens_used": 0,
-            "rows_processed": 0,
-        })
-        .execute()
-        .data
-    )
-    return inserted[0] if inserted else {"tokens_used": 0, "rows_processed": 0}
 
 
 def _build_backfill_text(row: dict) -> str:
@@ -112,22 +60,9 @@ def _build_backfill_text(row: dict) -> str:
 
 
 def run_ai_backfill() -> None:
-    cfg = _load_config(YOHR_ORG_ID)
-    if not cfg or not cfg.get("enabled", False):
-        return  # not configured yet, or paused from the dashboard
-
-    now_ist = _current_ist()
-    if not _in_active_window(cfg, now_ist):
-        return
-
-    usage_date = now_ist.date().isoformat()
-    usage = _get_or_create_usage_row(YOHR_ORG_ID, usage_date)
-    tokens_used = usage.get("tokens_used") or 0
-    rows_processed = usage.get("rows_processed") or 0
-    budget = cfg.get("daily_token_budget") or 0
-
-    if tokens_used >= budget:
-        return  # today's budget already spent
+    status = get_budget_status(YOHR_ORG_ID, enforce_active_hours=True)
+    if not status["allowed"]:
+        return  # disabled, outside active hours, or today's budget already spent
 
     try:
         rows = (
@@ -152,17 +87,25 @@ def run_ai_backfill() -> None:
         return
 
     logger.info("ai_backfill: %d eligible rows, %d/%d tokens used today",
-                len(rows), tokens_used, budget)
+                len(rows), status["tokens_used"], status["budget"])
 
     for row in rows:
-        if tokens_used >= budget:
-            logger.info("ai_backfill: daily budget reached (%d/%d) — stopping for today",
-                        tokens_used, budget)
+        # Re-check on every row (not just once per tick): this is what makes
+        # the budget gate reflect the OTHER path's (normal ai_processor's)
+        # concurrent consumption too, not just this loop's own running total.
+        status = get_budget_status(YOHR_ORG_ID, enforce_active_hours=True)
+        if not status["allowed"]:
+            logger.info("ai_backfill: stopping for now (%s) — %d/%d tokens used today",
+                        status["reason"], status["tokens_used"], status["budget"])
             break
 
         row_id = row["id"]
         try:
             full_text = _build_backfill_text(row)
+            # tokens_this_call is only ever non-zero here because a real,
+            # successful OpenAI response was returned — record_usage() below
+            # is therefore never called for a row that didn't make a real
+            # request, and never called at all from the except branch.
             ai_result, tokens_this_call = _call_ai_raw(full_text, yohr_ai_client)
 
             supabase.table("org_csv_import_rows").update({
@@ -177,21 +120,15 @@ def run_ai_backfill() -> None:
                 "s4_status":           "pending",
             }).eq("id", row_id).execute()
 
-            tokens_used += tokens_this_call
-            rows_processed += 1
-            supabase.table("yohr_ai_daily_usage").update({
-                "tokens_used":    tokens_used,
-                "rows_processed": rows_processed,
-                "updated_at":     datetime.now(timezone.utc).isoformat(),
-            }).eq("organization_id", YOHR_ORG_ID).eq("usage_date", usage_date).execute()
+            record_usage(tokens_this_call, YOHR_ORG_ID)
 
-            logger.info("ai_backfill: row %s done (+%d tokens, %d/%d today)",
-                        row_id, tokens_this_call, tokens_used, budget)
+            logger.info("ai_backfill: row %s done (+%d tokens today)",
+                        row_id, tokens_this_call)
 
         except Exception as exc:
             # Left as s3_status='skipped' deliberately — this was never a
             # "real" S3 attempt before (it was skipped by design), so there's
             # no s3_attempts/failed semantics to reuse here. Just retry next
-            # tick.
+            # tick. No usage recorded — no real OpenAI response was returned.
             logger.warning("ai_backfill: row %s failed, will retry next tick: %s",
                            row_id, exc)

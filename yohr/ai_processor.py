@@ -19,11 +19,12 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from .constants import (
-    supabase, yohr_ai_client, ACTIVE_ORG_IDS,
+    supabase, yohr_ai_client, ACTIVE_ORG_IDS, YOHR_ORG_ID,
     STORAGE_BUCKET,
     OPENAI_MODEL, MAX_AI_TOKENS, MAX_AI_INPUT_CHARS,
     MAX_AI_WORKERS, MAX_AI_RETRIES,
 )
+from .ai_budget import get_budget_status, record_usage
 
 logger = logging.getLogger(__name__)
 
@@ -218,9 +219,8 @@ def _call_ai_raw(full_text: str, client) -> tuple[dict, int]:
     """
     Send compressed resume text to GPT via the given client and parse the
     structured JSON response. Returns (result_dict, total_tokens_used) so
-    callers that need to track usage (e.g. yohr/ai_backfill.py's daily
-    budget) can, without changing what _call_ai() below returns to its
-    existing callers.
+    callers (both this module's own _process_row and yohr/ai_backfill.py)
+    can record usage against the shared YOHR daily budget (see ai_budget.py).
     """
     compressed = _compress(full_text)
     ai_input = compressed[:MAX_AI_INPUT_CHARS]
@@ -263,23 +263,13 @@ def _call_ai_raw(full_text: str, client) -> tuple[dict, int]:
     return result, total_tokens
 
 
-def _call_ai(full_text: str) -> dict:
-    """Send compressed resume text to GPT and parse structured JSON response.
-
-    Unchanged external contract (same input, same output) — internals now
-    delegate to _call_ai_raw so the token-usage-tracking path in
-    yohr/ai_backfill.py can share this logic instead of duplicating it.
-    """
-    result, _tokens = _call_ai_raw(full_text, yohr_ai_client)
-    return result
-
-
 # ---------------------------------------------------------------------------
 # Row processor
 # ---------------------------------------------------------------------------
 
 def _process_row(row: dict) -> None:
     row_id   = row["id"]
+    org_id   = row.get("org_id")
     attempts = (row.get("s3_attempts") or 0) + 1
 
     supabase.table("org_csv_import_rows").update(
@@ -305,7 +295,10 @@ def _process_row(row: dict) -> None:
         full_text = _sanitize(full_text)
 
         # ── Call AI ───────────────────────────────────────────────────────
-        ai_result = _call_ai(full_text)
+        # _call_ai_raw (not _call_ai) so YOHR rows' token count can be
+        # recorded against the shared YOHR daily budget below — only ever
+        # recorded after this returns a real, successful response.
+        ai_result, tokens_this_call = _call_ai_raw(full_text, yohr_ai_client)
 
         # ── Persist ───────────────────────────────────────────────────────
         supabase.table("org_csv_import_rows").update({
@@ -314,6 +307,9 @@ def _process_row(row: dict) -> None:
             "resume_text_excerpt": full_text,   # store FULL text
             "ai_result":           ai_result,
         }).eq("id", row_id).execute()
+
+        if org_id == YOHR_ORG_ID:
+            record_usage(tokens_this_call, YOHR_ORG_ID)
 
         top_skills = ai_result.get("top_skills") or []
         logger.debug("ai_processor: row %s done — %d skills, %d jobs",
@@ -355,7 +351,7 @@ def run_ai_processor() -> None:
         rows = (
             supabase.table("org_csv_import_rows")
             .select(
-                "id, session_id, stored_resume_path, raw_name, raw_designation, "
+                "id, session_id, org_id, stored_resume_path, raw_name, raw_designation, "
                 "raw_company, raw_location, s3_attempts, resume_text_excerpt"
             )
             .in_("org_id", ACTIVE_ORG_IDS)
@@ -372,10 +368,29 @@ def run_ai_processor() -> None:
     if not rows:
         return
 
-    logger.info("ai_processor: processing %d rows", len(rows))
+    # YOHR rows share the same daily token budget as ai_backfill.py (see
+    # ai_budget.py) — checked ONCE per tick, not per-row: a slightly stale
+    # gate is an acceptable tradeoff against hitting the DB 50 times a tick.
+    # Non-YOHR rows (e.g. the demo org) are never subject to this budget.
+    dispatch_rows = rows
+    yohr_rows = [r for r in rows if r.get("org_id") == YOHR_ORG_ID]
+    if yohr_rows:
+        status = get_budget_status(YOHR_ORG_ID, enforce_active_hours=False)
+        if not status["allowed"]:
+            logger.info(
+                "ai_processor: YOHR daily AI budget check failed (%s, %d/%d tokens) — "
+                "deferring %d YOHR row(s) this tick, left pending for retry",
+                status["reason"], status["tokens_used"], status["budget"], len(yohr_rows),
+            )
+            dispatch_rows = [r for r in rows if r.get("org_id") != YOHR_ORG_ID]
+
+    if not dispatch_rows:
+        return
+
+    logger.info("ai_processor: processing %d rows", len(dispatch_rows))
 
     with ThreadPoolExecutor(max_workers=MAX_AI_WORKERS) as pool:
-        futures = {pool.submit(_process_row, row): row for row in rows}
+        futures = {pool.submit(_process_row, row): row for row in dispatch_rows}
         for future in as_completed(futures):
             row = futures[future]
             try:
@@ -383,7 +398,7 @@ def run_ai_processor() -> None:
             except Exception as exc:
                 logger.error("ai_processor: unhandled error for row %s: %s", row["id"], exc)
 
-    session_ids = {r["session_id"] for r in rows}
+    session_ids = {r["session_id"] for r in dispatch_rows}
     for sid in session_ids:
         try:
             supabase.rpc("refresh_csv_session_counts", {"p_session_id": sid}).execute()
