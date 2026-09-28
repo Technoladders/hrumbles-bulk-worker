@@ -25,6 +25,14 @@ else:
 
 RESUME_PATH_PREFIX = "yohr-csv"
 
+# Upper bound on how many NEW CSV rows csv_parser.py will read+insert for a
+# single session in one 30s tick. Keeps a single huge file (e.g. 500k rows)
+# from building the whole thing into memory at once or blocking one tick for
+# many minutes -- large files are instead processed across many ticks,
+# resuming from however many rows already exist for that session. See
+# yohr/csv_parser.py's _process_session and the s1_complete column.
+MAX_CSV_ROWS_PER_TICK = 20_000
+
 OPENAI_MODEL       = "gpt-4.1-nano"
 
 # Enough for full structured extraction (work_exp + education + projects + certs)

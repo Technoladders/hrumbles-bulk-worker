@@ -33,7 +33,7 @@ import phonenumbers
 import pycountry
 import country_converter as coco
 
-from .constants import supabase, ACTIVE_ORG_IDS
+from .constants import supabase, ACTIVE_ORG_IDS, MAX_CSV_ROWS_PER_TICK
 
 logger = logging.getLogger(__name__)
 
@@ -267,7 +267,8 @@ def run_csv_parser() -> None:
             .select("id, file_storage_path, filename, org_id, column_mapping, "
                     "ai_processing_enabled, resume_download_enabled")
             .in_("org_id", ACTIVE_ORG_IDS)
-            .eq("status", "pending")
+            .in_("status", ["pending", "processing"])
+            .eq("s1_complete", False)
             .execute()
             .data
         )
@@ -289,9 +290,31 @@ def _process_session(session: dict) -> None:
     resume_enabled = session.get("resume_download_enabled")
     resume_enabled = True if resume_enabled is None else resume_enabled
 
-    logger.info("csv_parser: starting session %s (%s)", session_id, session["filename"])
-
     from .constants import STORAGE_BUCKET
+
+    # How many rows this session already has -- 0 on a first attempt, >0 when
+    # resuming a large file (or retrying after a batch failure) across
+    # multiple ticks. The CSV is always re-read from the start (no seekable
+    # cursor is persisted), but rows up to this count are skipped rather than
+    # re-inserted, so a transient mid-file failure only ever costs re-reading
+    # the file, never re-writing or losing already-committed rows.
+    try:
+        already_inserted = (
+            supabase.table("org_csv_import_rows")
+            .select("id", count="exact", head=True)
+            .eq("session_id", session_id)
+            .execute()
+            .count
+        ) or 0
+    except Exception as exc:
+        logger.error("csv_parser: row-count check failed for session %s: %s", session_id, exc)
+        return
+
+    logger.info(
+        "csv_parser: %s session %s (%s) — %d row(s) already inserted",
+        "resuming" if already_inserted else "starting",
+        session_id, session["filename"], already_inserted,
+    )
 
     supabase.table("org_csv_import_sessions").update(
         {"status": "processing"}
@@ -303,7 +326,7 @@ def _process_session(session: dict) -> None:
     except Exception as exc:
         logger.error("csv_parser: storage download failed for session %s: %s", session_id, exc)
         supabase.table("org_csv_import_sessions").update(
-            {"status": "failed", "error_summary": f"CSV download failed: {exc}"}
+            {"status": "failed", "s1_complete": True, "error_summary": f"CSV download failed: {exc}"}
         ).eq("id", session_id).execute()
         return
 
@@ -313,7 +336,11 @@ def _process_session(session: dict) -> None:
 
         resolved = existing_mapping or resolve_columns(all_headers)
 
-        if "name" not in resolved or ("phone" not in resolved and "email" not in resolved):
+        # Only relevant on a brand-new session -- if rows already exist,
+        # column resolution necessarily already succeeded for this file.
+        if not already_inserted and (
+            "name" not in resolved or ("phone" not in resolved and "email" not in resolved)
+        ):
             supabase.table("org_csv_import_sessions").update({
                 "status":           "pending_mapping",
                 "detected_headers": all_headers,
@@ -327,32 +354,62 @@ def _process_session(session: dict) -> None:
 
         mapped_headers = set(resolved.values())
 
+        # Bounded per tick: a single huge file is processed across many
+        # ticks instead of building the whole thing into memory and blocking
+        # one tick for minutes. row_num <= already_inserted skips rows a
+        # previous tick already committed.
         rows_to_insert = []
+        reader_exhausted = True
         for row_num, raw_row in enumerate(reader, start=1):
+            if row_num <= already_inserted:
+                continue
+            if len(rows_to_insert) >= MAX_CSV_ROWS_PER_TICK:
+                reader_exhausted = False
+                break
             record = _build_row_record(
                 session_id, org_id, row_num, raw_row,
                 resolved, mapped_headers, ai_enabled, resume_enabled,
             )
             rows_to_insert.append(record)
 
-        if not rows_to_insert:
+        if not already_inserted and not rows_to_insert and reader_exhausted:
             logger.warning("csv_parser: no rows found in session %s", session_id)
             supabase.table("org_csv_import_sessions").update(
-                {"status": "failed", "error_summary": "CSV contained no data rows"}
+                {"status": "failed", "s1_complete": True, "error_summary": "CSV contained no data rows"}
             ).eq("id", session_id).execute()
             return
 
         for i in range(0, len(rows_to_insert), 200):
             supabase.table("org_csv_import_rows").insert(rows_to_insert[i:i + 200]).execute()
 
+        if reader_exhausted:
+            supabase.table("org_csv_import_sessions").update(
+                {"s1_complete": True}
+            ).eq("id", session_id).execute()
+
         supabase.rpc("refresh_csv_session_counts", {"p_session_id": session_id}).execute()
-        logger.info("csv_parser: session %s — inserted %d rows", session_id, len(rows_to_insert))
+        logger.info(
+            "csv_parser: session %s — inserted %d new row(s) this tick (%s)",
+            session_id, len(rows_to_insert),
+            "file fully read" if reader_exhausted else "more rows remain, resuming next tick",
+        )
 
     except Exception as exc:
-        logger.error("csv_parser: parse error for session %s: %s", session_id, exc, exc_info=True)
-        supabase.table("org_csv_import_sessions").update(
-            {"status": "failed", "error_summary": str(exc)}
-        ).eq("id", session_id).execute()
+        # Deliberately NOT marking the session 'failed' or s1_complete=true
+        # here -- this is the fix for the bug where a single transient error
+        # (e.g. an HTTP/2 ConnectionTerminated mid-batch) silently truncated
+        # the rest of the file. Whatever batches already committed THIS tick
+        # stay committed; the next tick's already_inserted count picks up
+        # from exactly there.
+        logger.warning(
+            "csv_parser: batch failed for session %s (%d row(s) already inserted before "
+            "this tick) — will resume from there next tick: %s",
+            session_id, already_inserted, exc,
+        )
+        try:
+            supabase.rpc("refresh_csv_session_counts", {"p_session_id": session_id}).execute()
+        except Exception:
+            pass
 
 
 def _build_row_record(
