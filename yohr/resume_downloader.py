@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from .fair_share import fetch_fair_share
 from .constants import (
     supabase, ACTIVE_ORG_IDS, STORAGE_BUCKET, RESUME_PATH_PREFIX,
     MAX_DOWNLOAD_WORKERS, MAX_DOWNLOAD_RETRIES, DOWNLOAD_TIMEOUT,
@@ -57,15 +58,15 @@ def run_downloader() -> None:
         logger.warning("downloader: stuck-row reset failed (non-fatal): %s", exc)
 
     try:
-        rows = (
-            supabase.table("org_csv_import_rows")
-            .select("id, session_id, org_id, raw_resume_url, s2_attempts")
-            .in_("org_id", ACTIVE_ORG_IDS)
-            .eq("s1_status", "done")
-            .eq("s2_status", "pending")
-            .limit(80)
-            .execute()
-            .data
+        rows = fetch_fair_share(
+            lambda: (
+                supabase.table("org_csv_import_rows")
+                .select("id, session_id, row_number, org_id, raw_resume_url, s2_attempts")
+                .in_("org_id", ACTIVE_ORG_IDS)
+                .eq("s1_status", "done")
+                .eq("s2_status", "pending")
+            ),
+            limit=80,
         )
     except Exception as exc:
         logger.error("downloader: failed to fetch rows: %s", exc)
