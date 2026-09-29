@@ -15,7 +15,8 @@ import logging
 import re
 from typing import Any, Optional
 
-from .constants import supabase, YOHR_ORG_ID, ACTIVE_ORG_IDS, STORAGE_PUBLIC_BASE
+from .fair_share import fetch_fair_share
+from .constants import supabase, YOHR_ORG_ID, ACTIVE_ORG_IDS, STORAGE_PUBLIC_BASE, INGEST_ROWS_PER_TICK
 
 logger = logging.getLogger(__name__)
 
@@ -273,21 +274,26 @@ def _upsert_rows(talent_records: list[dict], rows: list[dict],
 
 def run_ingestor() -> None:
     try:
-        rows = (
-            supabase.table("org_csv_import_rows")
-            .select(
-                "id, session_id, "
-                "raw_name, raw_designation, raw_company, raw_notice, raw_location, "
-                "raw_email, raw_linkedin, raw_extra_fields, "
-                "parsed_phone, parsed_linkedin, "
-                "stored_resume_path, ai_result, resume_text_excerpt"
-            )
-            .in_("org_id", ACTIVE_ORG_IDS)
-            .in_("s3_status", ["done", "skipped"])
-            .eq("s4_status", "pending")
-            .limit(60)
-            .execute()
-            .data
+        # s2 gate: with AI disabled, s3 is 'skipped' from the start, so
+        # without this a row was ingested before its resume finished
+        # downloading and the candidate landed in the talent pool with no
+        # resume. Wait until the download is done, skipped or has given up.
+        rows = fetch_fair_share(
+            lambda: (
+                supabase.table("org_csv_import_rows")
+                .select(
+                    "id, session_id, row_number, "
+                    "raw_name, raw_designation, raw_company, raw_notice, raw_location, "
+                    "raw_email, raw_linkedin, raw_extra_fields, "
+                    "parsed_phone, parsed_linkedin, "
+                    "stored_resume_path, ai_result, resume_text_excerpt"
+                )
+                .in_("org_id", ACTIVE_ORG_IDS)
+                .in_("s2_status", ["done", "skipped", "failed"])
+                .in_("s3_status", ["done", "skipped"])
+                .eq("s4_status", "pending")
+            ),
+            limit=INGEST_ROWS_PER_TICK,
         )
     except Exception as exc:
         logger.error("ingestor: fetch failed: %s", exc)

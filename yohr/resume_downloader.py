@@ -12,9 +12,11 @@ from urllib.parse import urlparse
 
 import requests
 
+from .fair_share import fetch_fair_share
 from .constants import (
     supabase, ACTIVE_ORG_IDS, STORAGE_BUCKET, RESUME_PATH_PREFIX,
     MAX_DOWNLOAD_WORKERS, MAX_DOWNLOAD_RETRIES, DOWNLOAD_TIMEOUT,
+    MAX_RESUME_BYTES, DOWNLOAD_ROWS_PER_TICK,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,15 +59,15 @@ def run_downloader() -> None:
         logger.warning("downloader: stuck-row reset failed (non-fatal): %s", exc)
 
     try:
-        rows = (
-            supabase.table("org_csv_import_rows")
-            .select("id, session_id, org_id, raw_resume_url, s2_attempts")
-            .in_("org_id", ACTIVE_ORG_IDS)
-            .eq("s1_status", "done")
-            .eq("s2_status", "pending")
-            .limit(80)
-            .execute()
-            .data
+        rows = fetch_fair_share(
+            lambda: (
+                supabase.table("org_csv_import_rows")
+                .select("id, session_id, row_number, org_id, raw_resume_url, s2_attempts")
+                .in_("org_id", ACTIVE_ORG_IDS)
+                .eq("s1_status", "done")
+                .eq("s2_status", "pending")
+            ),
+            limit=DOWNLOAD_ROWS_PER_TICK,
         )
     except Exception as exc:
         logger.error("downloader: failed to fetch rows: %s", exc)
@@ -106,7 +108,16 @@ def _download_row(row: dict) -> None:
     try:
         resp = requests.get(url, timeout=DOWNLOAD_TIMEOUT, stream=True)
         resp.raise_for_status()
-        pdf_bytes = resp.content
+        declared = int(resp.headers.get("Content-Length") or 0)
+        if declared > MAX_RESUME_BYTES:
+            raise ValueError(f"Resume too large ({declared} bytes > {MAX_RESUME_BYTES})")
+        chunks, size = [], 0
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            size += len(chunk)
+            if size > MAX_RESUME_BYTES:
+                raise ValueError(f"Resume too large (> {MAX_RESUME_BYTES} bytes)")
+            chunks.append(chunk)
+        pdf_bytes = b"".join(chunks)
 
         if len(pdf_bytes) < 100:
             raise ValueError(f"Response too small ({len(pdf_bytes)} bytes)")
