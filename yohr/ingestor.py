@@ -223,31 +223,72 @@ def _sync_skills_master(skills: set[str]) -> None:
 # Upsert helpers
 # ---------------------------------------------------------------------------
 
+def _dedupe_by_email(talent_records: list[dict]) -> list[dict]:
+    """
+    Postgres rejects a bulk upsert that touches the same (email, org) twice
+    ("ON CONFLICT DO UPDATE command cannot affect row a second time"), which
+    used to drop the whole batch into the slow one-by-one fallback. Merge
+    such records: later non-empty values win, earlier values fill the gaps.
+    """
+    merged: dict[tuple, dict] = {}
+    for rec in talent_records:
+        key = ((rec.get("email") or "").strip().lower(), rec.get("organization_id"))
+        prev = merged.get(key)
+        if prev is None:
+            merged[key] = dict(rec)
+        else:
+            for k, v in rec.items():
+                if v not in (None, "", [], {}):
+                    prev[k] = v
+    return list(merged.values())
+
+
+def _mark_rows(updates: list[dict]) -> None:
+    """
+    Write s4 results for many rows in one request per chunk (upsert on id,
+    only the given columns are updated). This replaced one UPDATE per row --
+    ~0.08 s each, i.e. ~40 s for a 500-row tick -- which capped ingest far
+    below the download stage.
+    """
+    for i in range(0, len(updates), 500):
+        supabase.table("org_csv_import_rows").upsert(
+            updates[i:i + 500], on_conflict="id"
+        ).execute()
+
+
+def _row_update(row: dict, **fields) -> dict:
+    # session_id / row_number / org_id are NOT NULL, so they must be present
+    # in the upsert payload even though only the s4 fields change.
+    return {"id": row["id"], "session_id": row["session_id"],
+            "row_number": row["row_number"], "org_id": row["org_id"], **fields}
+
+
 def _upsert_rows(talent_records: list[dict], rows: list[dict],
                  row_id_map: dict[str, dict]) -> None:
     """Bulk upsert with per-row fallback on failure."""
+    rows_by_id = {r["id"]: r for r in rows}
     try:
         result = (
             supabase.table("hr_talent_pool")
-            .upsert(talent_records, on_conflict="email,organization_id")
+            .upsert(_dedupe_by_email(talent_records), on_conflict="email,organization_id")
             .execute()
         )
         upserted     = result.data or []
-        email_to_id  = {r["email"]: r["id"] for r in upserted if "email" in r and "id" in r}
+        email_to_id  = {(r["email"] or "").strip().lower(): r["id"]
+                        for r in upserted if "email" in r and "id" in r}
 
-        for row_id, rec in row_id_map.items():
-            tp_id = email_to_id.get(rec["email"])
-            supabase.table("org_csv_import_rows").update({
-                "s4_status":      "done",
-                "s4_error":       None,
-                "talent_pool_id": tp_id,
-            }).eq("id", row_id).execute()
-
+        _mark_rows([
+            _row_update(rows_by_id[row_id], s4_status="done", s4_error=None,
+                        talent_pool_id=email_to_id.get((rec["email"] or "").strip().lower()))
+            for row_id, rec in row_id_map.items()
+        ])
         logger.info("ingestor: bulk upsert OK — %d records", len(upserted))
 
     except Exception as exc:
         logger.warning("ingestor: bulk upsert failed (%s) — falling back to individual", exc)
+        updates = []
         for row_id, rec in row_id_map.items():
+            row = rows_by_id[row_id]
             try:
                 res = (
                     supabase.table("hr_talent_pool")
@@ -255,17 +296,11 @@ def _upsert_rows(talent_records: list[dict], rows: list[dict],
                     .execute()
                 )
                 tp_id = res.data[0]["id"] if res.data else None
-                supabase.table("org_csv_import_rows").update({
-                    "s4_status":      "done",
-                    "s4_error":       None,
-                    "talent_pool_id": tp_id,
-                }).eq("id", row_id).execute()
+                updates.append(_row_update(row, s4_status="done", s4_error=None, talent_pool_id=tp_id))
             except Exception as row_exc:
-                supabase.table("org_csv_import_rows").update({
-                    "s4_status": "failed",
-                    "s4_error":  str(row_exc),
-                }).eq("id", row_id).execute()
+                updates.append(_row_update(row, s4_status="failed", s4_error=str(row_exc)))
                 logger.warning("ingestor: row %s failed: %s", row_id, row_exc)
+        _mark_rows(updates)
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +317,7 @@ def run_ingestor() -> None:
             lambda: (
                 supabase.table("org_csv_import_rows")
                 .select(
-                    "id, session_id, row_number, "
+                    "id, session_id, row_number, org_id, "
                     "raw_name, raw_designation, raw_company, raw_notice, raw_location, "
                     "raw_email, raw_linkedin, raw_extra_fields, "
                     "parsed_phone, parsed_linkedin, "
@@ -326,7 +361,10 @@ def run_ingestor() -> None:
 
     for row in rows:
         created_by = session_created_by.get(row["session_id"])
-        record, skills = _build_talent_record(row, created_by=created_by)
+        # org_id is only selected for the s4 status write-back; leave the
+        # record's organization resolution exactly as before.
+        build_input = {k: v for k, v in row.items() if k != "org_id"}
+        record, skills = _build_talent_record(build_input, created_by=created_by)
         if record:
             talent_records.append(record)
             row_id_map[row["id"]] = record
