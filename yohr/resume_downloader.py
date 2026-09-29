@@ -13,7 +13,9 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 
 import requests
+from supabase import create_client
 
+from config import SUPABASE_URL, SUPABASE_SERVICE_KEY
 from .fair_share import fetch_fair_share
 from .constants import (
     supabase, ACTIVE_ORG_IDS, STORAGE_BUCKET, RESUME_PATH_PREFIX,
@@ -149,15 +151,42 @@ def _refresh_touched_sessions() -> None:
             logger.warning("downloader: refresh counts failed for %s: %s", sid, exc)
 
 
+def _db():
+    """Per-thread Supabase client. The shared module-level client multiplexes
+    every download thread over ONE HTTP/2 connection: when Supabase drops it
+    ("Server disconnected", h2 "deque mutated during iteration"), every
+    in-flight request fails at once -- including the final status update,
+    stranding ~24 rows in "downloading" each time. storage3 then masks the
+    upload error as "cannot access local variable 'response'"."""
+    c = getattr(_thread_local, "db", None)
+    if c is None:
+        c = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        _thread_local.db = c
+    return c
+
+
+def _set_row(row_id: str, payload: dict, tries: int = 3) -> None:
+    """Row status update that survives a dropped connection: on failure,
+    rebuild this thread's client and retry, so a row isn't left
+    "downloading" for the 10-minute stuck-row reset to find."""
+    for i in range(tries):
+        try:
+            _db().table("org_csv_import_rows").update(payload).eq("id", row_id).execute()
+            return
+        except Exception:
+            _thread_local.db = None
+            if i == tries - 1:
+                raise
+            time.sleep(0.5 * (i + 1))
+
+
 def _download_row(row: dict) -> None:
     row_id     = row["id"]
     session_id = row["session_id"]
     url        = row["raw_resume_url"]
     attempts   = row.get("s2_attempts", 0) + 1
 
-    supabase.table("org_csv_import_rows").update(
-        {"s2_status": "downloading", "s2_attempts": attempts}
-    ).eq("id", row_id).execute()
+    _set_row(row_id, {"s2_status": "downloading", "s2_attempts": attempts})
 
     try:
         resp = _http().get(url, timeout=DOWNLOAD_TIMEOUT, stream=True)
@@ -181,25 +210,28 @@ def _download_row(row: dict) -> None:
 
         org_id = row.get("org_id", "")
         storage_path = _storage_path(org_id, session_id, url)
-        supabase.storage.from_(STORAGE_BUCKET).upload(
+        _db().storage.from_(STORAGE_BUCKET).upload(
             path=storage_path,
             file=pdf_bytes,
             file_options={"content-type": "application/pdf", "upsert": "true"},
         )
 
-        supabase.table("org_csv_import_rows").update({
+        _set_row(row_id, {
             "s2_status":          "done",
             "stored_resume_path": storage_path,
             "s2_error":           None,
-        }).eq("id", row_id).execute()
+        })
         logger.debug("downloader: row %s — OK (%d bytes)", row_id, len(pdf_bytes))
 
     except Exception as exc:
         error_msg  = str(exc)
         new_status = "failed" if attempts >= MAX_DOWNLOAD_RETRIES else "pending"
         logger.warning("downloader: row %s attempt %d failed: %s", row_id, attempts, error_msg)
-        supabase.table("org_csv_import_rows").update({
+        # A failed upload may have come from a dropped connection: start the
+        # next attempt on this thread with a fresh client.
+        _thread_local.db = None
+        _set_row(row_id, {
             "s2_status":   new_status,
             "s2_attempts": attempts,
             "s2_error":    error_msg,
-        }).eq("id", row_id).execute()
+        })
