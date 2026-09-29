@@ -57,6 +57,9 @@ DOWNLOAD_ROWS_PER_TICK = int(os.getenv("DOWNLOAD_ROWS_PER_TICK", "160"))
 INGEST_ROWS_PER_TICK   = int(os.getenv("INGEST_ROWS_PER_TICK", "150"))
 MAX_DOWNLOAD_RETRIES = 3
 DOWNLOAD_TIMEOUT     = 30
+# Hard wall-clock limit per resume: DOWNLOAD_TIMEOUT only bounds each socket
+# read, so a server trickling bytes could hold a worker for many minutes.
+DOWNLOAD_TOTAL_TIMEOUT = 60
 MAX_AI_RETRIES       = 2
 
 # Public URL base — used to build full downloadable resume links
