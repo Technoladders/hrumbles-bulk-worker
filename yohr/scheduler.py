@@ -18,6 +18,7 @@ def register_yohr_jobs(scheduler) -> None:
     from .ai_processor      import run_ai_processor
     from .ingestor          import run_ingestor
     from .ai_backfill       import run_ai_backfill
+    from .ai_manual         import run_ai_manual
 
     scheduler.add_job(
         func=_safe(run_csv_parser),
@@ -58,7 +59,16 @@ def register_yohr_jobs(scheduler) -> None:
         max_instances=1,
         replace_existing=True,
     )
-    logger.info("YOHR: all 4 pipeline jobs + AI backfill registered")
+    # On-demand "run AI on N profiles" requests from the CSV Import History
+    # page (yohr_ai_manual_runs). Same budget/active hours as the backfill.
+    scheduler.add_job(
+        func=_safe(run_ai_manual),
+        trigger="interval", seconds=20,
+        id="yohr_ai_manual",
+        max_instances=1,
+        replace_existing=True,
+    )
+    logger.info("YOHR: all 4 pipeline jobs + AI backfill + manual AI runs registered")
 
 
 def _safe(fn):
