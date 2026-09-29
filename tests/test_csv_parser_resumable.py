@@ -258,5 +258,48 @@ class TestResumableCsvParsing(unittest.TestCase):
         self.assertEqual(len(fake.rows), total_rows)
 
 
+    def test_rows_are_inserted_while_reading_not_all_at_once(self):
+        # Regression: a tick used to build MAX_CSV_ROWS_PER_TICK records before
+        # the first insert (~360 MB on a 92k-row file -> container OOM).
+        fake = FakeSupabase(_make_csv(1000))
+        built = []
+        seen_at_insert = []
+        real_build = csv_parser._build_row_record
+
+        def counting_build(*a, **k):
+            built.append(1)
+            return real_build(*a, **k)
+
+        real_table = fake.table
+
+        def spying_table(name):
+            q = real_table(name)
+            real_upsert = q.upsert
+
+            def upsert(rows, **k):
+                seen_at_insert.append((len(built), len(rows)))
+                return real_upsert(rows, **k)
+            q.upsert = upsert
+            return q
+
+        fake.table = spying_table
+        with patch.object(csv_parser, "supabase", fake), \
+             patch.object(csv_parser, "_build_row_record", counting_build):
+            csv_parser._process_session(dict(SESSION_ROW))
+
+        self.assertEqual(len(fake.rows), 1000)
+        self.assertTrue(fake.session["s1_complete"])
+        # Each insert happens as soon as its batch is built.
+        for built_so_far, batch_len in seen_at_insert:
+            self.assertLessEqual(batch_len, csv_parser.INSERT_BATCH_SIZE)
+        self.assertEqual(seen_at_insert[0][0], csv_parser.INSERT_BATCH_SIZE)
+
+    def test_utf8_bom_header_is_stripped(self):
+        fake = FakeSupabase(b"\xef\xbb\xbf" + _make_csv(3))
+        with patch.object(csv_parser, "supabase", fake):
+            csv_parser._process_session(dict(SESSION_ROW))
+        self.assertEqual(len(fake.rows), 3)
+        self.assertEqual(fake.rows[0]["raw_email"], "candidate1@example.com")
+
 if __name__ == "__main__":
     unittest.main()

@@ -35,6 +35,9 @@ import country_converter as coco
 
 from .constants import supabase, ACTIVE_ORG_IDS, MAX_CSV_ROWS_PER_TICK
 
+# Rows per insert request; also the most record dicts held in memory at once.
+INSERT_BATCH_SIZE = 200
+
 logger = logging.getLogger(__name__)
 
 # ── Sub-national region overrides (pycountry/coco don't know these) ───────────
@@ -332,7 +335,6 @@ def _process_session(session: dict) -> None:
 
     try:
         csv_bytes: bytes = supabase.storage.from_(STORAGE_BUCKET).download(storage_path)
-        csv_text = csv_bytes.decode("utf-8-sig")
     except Exception as exc:
         if already_inserted:
             # Mid-file resume: a transient storage/HTTP error must not mark the
@@ -350,7 +352,10 @@ def _process_session(session: dict) -> None:
         return
 
     try:
-        reader      = csv.DictReader(io.StringIO(csv_text))
+        # Decode lazily while reading instead of building a second full copy
+        # of the file as one str (a 32 MB CSV is ~90k rows).
+        csv_stream  = io.TextIOWrapper(io.BytesIO(csv_bytes), encoding="utf-8-sig", newline="")
+        reader      = csv.DictReader(csv_stream)
         all_headers = reader.fieldnames or []
 
         resolved = existing_mapping or resolve_columns(all_headers)
@@ -374,39 +379,51 @@ def _process_session(session: dict) -> None:
         mapped_headers = set(resolved.values())
 
         # Bounded per tick: a single huge file is processed across many
-        # ticks instead of building the whole thing into memory and blocking
-        # one tick for minutes. row_num <= already_inserted skips rows a
-        # previous tick already committed.
-        rows_to_insert = []
+        # ticks. row_num <= already_inserted skips rows a previous tick
+        # already committed. Rows are inserted in batches of
+        # INSERT_BATCH_SIZE as they are built, so memory stays flat instead
+        # of holding MAX_CSV_ROWS_PER_TICK record dicts at once -- that
+        # peaked at ~360 MB on a 92k-row file and OOM-killed the 512 MiB
+        # container (killing in-flight downloads with it) every tick.
+        #
+        # Idempotent insert: a (session_id, row_number) that already exists is
+        # skipped, so a wrong resume point can never create duplicate rows.
+        # Requires the unique index in migrations/20260929_org_csv_import_rows_unique.sql.
+        def _flush(batch: list[dict]) -> None:
+            supabase.table("org_csv_import_rows").upsert(
+                batch,
+                on_conflict="session_id,row_number",
+                ignore_duplicates=True,
+            ).execute()
+
+        batch: list[dict] = []
+        inserted_this_tick = 0
         reader_exhausted = True
         for row_num, raw_row in enumerate(reader, start=1):
             if row_num <= already_inserted:
                 continue
-            if len(rows_to_insert) >= MAX_CSV_ROWS_PER_TICK:
+            if inserted_this_tick + len(batch) >= MAX_CSV_ROWS_PER_TICK:
                 reader_exhausted = False
                 break
-            record = _build_row_record(
+            batch.append(_build_row_record(
                 session_id, org_id, row_num, raw_row,
                 resolved, mapped_headers, ai_enabled, resume_enabled,
-            )
-            rows_to_insert.append(record)
+            ))
+            if len(batch) >= INSERT_BATCH_SIZE:
+                _flush(batch)
+                inserted_this_tick += len(batch)
+                batch = []
+        if batch:
+            _flush(batch)
+            inserted_this_tick += len(batch)
+            batch = []
 
-        if not already_inserted and not rows_to_insert and reader_exhausted:
+        if not already_inserted and not inserted_this_tick and reader_exhausted:
             logger.warning("csv_parser: no rows found in session %s", session_id)
             supabase.table("org_csv_import_sessions").update(
                 {"status": "failed", "s1_complete": True, "error_summary": "CSV contained no data rows"}
             ).eq("id", session_id).execute()
             return
-
-        # Idempotent insert: a (session_id, row_number) that already exists is
-        # skipped, so a wrong resume point can never create duplicate rows.
-        # Requires the unique index in migrations/20260929_org_csv_import_rows_unique.sql.
-        for i in range(0, len(rows_to_insert), 200):
-            supabase.table("org_csv_import_rows").upsert(
-                rows_to_insert[i:i + 200],
-                on_conflict="session_id,row_number",
-                ignore_duplicates=True,
-            ).execute()
 
         if reader_exhausted:
             supabase.table("org_csv_import_sessions").update(
@@ -416,7 +433,7 @@ def _process_session(session: dict) -> None:
         supabase.rpc("refresh_csv_session_counts", {"p_session_id": session_id}).execute()
         logger.info(
             "csv_parser: session %s — inserted %d new row(s) this tick (%s)",
-            session_id, len(rows_to_insert),
+            session_id, inserted_this_tick,
             "file fully read" if reader_exhausted else "more rows remain, resuming next tick",
         )
 
