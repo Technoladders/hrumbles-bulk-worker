@@ -16,6 +16,7 @@ from .fair_share import fetch_fair_share
 from .constants import (
     supabase, ACTIVE_ORG_IDS, STORAGE_BUCKET, RESUME_PATH_PREFIX,
     MAX_DOWNLOAD_WORKERS, MAX_DOWNLOAD_RETRIES, DOWNLOAD_TIMEOUT,
+    MAX_RESUME_BYTES, DOWNLOAD_ROWS_PER_TICK,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,7 @@ def run_downloader() -> None:
                 .eq("s1_status", "done")
                 .eq("s2_status", "pending")
             ),
-            limit=80,
+            limit=DOWNLOAD_ROWS_PER_TICK,
         )
     except Exception as exc:
         logger.error("downloader: failed to fetch rows: %s", exc)
@@ -107,7 +108,16 @@ def _download_row(row: dict) -> None:
     try:
         resp = requests.get(url, timeout=DOWNLOAD_TIMEOUT, stream=True)
         resp.raise_for_status()
-        pdf_bytes = resp.content
+        declared = int(resp.headers.get("Content-Length") or 0)
+        if declared > MAX_RESUME_BYTES:
+            raise ValueError(f"Resume too large ({declared} bytes > {MAX_RESUME_BYTES})")
+        chunks, size = [], 0
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            size += len(chunk)
+            if size > MAX_RESUME_BYTES:
+                raise ValueError(f"Resume too large (> {MAX_RESUME_BYTES} bytes)")
+            chunks.append(chunk)
+        pdf_bytes = b"".join(chunks)
 
         if len(pdf_bytes) < 100:
             raise ValueError(f"Response too small ({len(pdf_bytes)} bytes)")

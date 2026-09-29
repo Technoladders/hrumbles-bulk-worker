@@ -16,7 +16,7 @@ import re
 from typing import Any, Optional
 
 from .fair_share import fetch_fair_share
-from .constants import supabase, YOHR_ORG_ID, ACTIVE_ORG_IDS, STORAGE_PUBLIC_BASE
+from .constants import supabase, YOHR_ORG_ID, ACTIVE_ORG_IDS, STORAGE_PUBLIC_BASE, INGEST_ROWS_PER_TICK
 
 logger = logging.getLogger(__name__)
 
@@ -293,7 +293,7 @@ def run_ingestor() -> None:
                 .in_("s3_status", ["done", "skipped"])
                 .eq("s4_status", "pending")
             ),
-            limit=60,
+            limit=INGEST_ROWS_PER_TICK,
         )
     except Exception as exc:
         logger.error("ingestor: fetch failed: %s", exc)
