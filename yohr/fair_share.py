@@ -36,7 +36,7 @@ def _open_session_ids() -> list[str]:
     return [r["id"] for r in rows]
 
 
-def fetch_fair_share(build_query: Callable[[], object], limit: int) -> list[dict]:
+def fetch_fair_share(build_query: Callable[[], object], limit: int, exclude_ids=None) -> list[dict]:
     """
     build_query() must return a fresh postgrest query for the stage's pending
     rows (select + filters, no limit). Returns up to `limit` rows spread
@@ -49,7 +49,9 @@ def fetch_fair_share(build_query: Callable[[], object], limit: int) -> list[dict
         session_ids = []
 
     rows: list[dict] = []
-    seen: set = set()
+    # Rows the caller is already working on count as seen, so they're skipped
+    # instead of taking up this tick's budget.
+    seen: set = set(exclude_ids or ())
     last_row: dict[str, int] = {}
 
     # Water-filling: give every open session an equal share; sessions that
