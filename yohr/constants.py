@@ -46,15 +46,18 @@ MAX_AI_INPUT_CHARS = 20_000
 # other concurrent stages (S2 downloads, ai_backfill). Fewer concurrent
 # threads here reduces this process's peak share of that shared ceiling.
 MAX_AI_WORKERS       = 2
-# Downloads are network-bound and hold at most one capped resume in memory
-# each (MAX_RESUME_BYTES), so 8 threads peak at ~80 MB worst case, typically
-# ~10 MB. The Sep-28 OOM kills were traced to the rq process, not S2.
-MAX_DOWNLOAD_WORKERS = int(os.getenv("MAX_DOWNLOAD_WORKERS", "8"))
-MAX_RESUME_BYTES     = 10 * 1024 * 1024
-# Rows per scheduler tick (S2 every 15 s, S4 every 15 s). S4 was the hidden
-# throughput ceiling at 60/tick (~240 rows/min) regardless of S2 speed.
-DOWNLOAD_ROWS_PER_TICK = int(os.getenv("DOWNLOAD_ROWS_PER_TICK", "160"))
-INGEST_ROWS_PER_TICK   = int(os.getenv("INGEST_ROWS_PER_TICK", "150"))
+# Downloads are network-bound (~0.3 s fetch + ~0.3 s storage upload + DB
+# updates per resume, CPU mostly idle) and each holds at most one capped
+# resume in memory. Real resumes are ~120 KB (max seen ~300 KB), so 24
+# threads use ~5 MB typically and at most 24 x 4 MB = 96 MB worst case,
+# under the container's 512 MiB. The Sep-28 OOM kills were the rq process.
+MAX_DOWNLOAD_WORKERS = int(os.getenv("MAX_DOWNLOAD_WORKERS", "24"))
+MAX_RESUME_BYTES     = 4 * 1024 * 1024
+# Rows per scheduler tick (S2 and S4 each run every 15 s). Keep S4 >= S2's
+# throughput (~24 workers / 0.8 s = ~1,800 rows/min) or ingest becomes the
+# ceiling again.
+DOWNLOAD_ROWS_PER_TICK = int(os.getenv("DOWNLOAD_ROWS_PER_TICK", "500"))
+INGEST_ROWS_PER_TICK   = int(os.getenv("INGEST_ROWS_PER_TICK", "500"))
 MAX_DOWNLOAD_RETRIES = 3
 DOWNLOAD_TIMEOUT     = 30
 # Hard wall-clock limit per resume: DOWNLOAD_TIMEOUT only bounds each socket

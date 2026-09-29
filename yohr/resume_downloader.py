@@ -87,6 +87,22 @@ def run_downloader() -> None:
 # every tick waited for ALL of its downloads, so one slow/hung URL froze the
 # whole pipeline for minutes (bursts of progress, then nothing). Now a hung
 # download only occupies its own worker slot.
+_thread_local = threading.local()
+
+
+def _http() -> requests.Session:
+    """Per-thread keep-alive session: resumes all come from the same few hosts,
+    so reusing connections skips a TCP + TLS handshake on every download."""
+    s = getattr(_thread_local, "session", None)
+    if s is None:
+        s = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _thread_local.session = s
+    return s
+
+
 _pool = ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS, thread_name_prefix="yohr-dl")
 _in_flight: set[str] = set()           # row ids queued or running
 _touched_sessions: set[str] = set()    # sessions with rows finished since last refresh
@@ -144,7 +160,7 @@ def _download_row(row: dict) -> None:
     ).eq("id", row_id).execute()
 
     try:
-        resp = requests.get(url, timeout=DOWNLOAD_TIMEOUT, stream=True)
+        resp = _http().get(url, timeout=DOWNLOAD_TIMEOUT, stream=True)
         resp.raise_for_status()
         declared = int(resp.headers.get("Content-Length") or 0)
         if declared > MAX_RESUME_BYTES:
