@@ -12,11 +12,12 @@ Key changes vs previous version:
 """
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 import re
 from typing import Any, Optional
 
 from .fair_share import fetch_fair_share
-from .constants import supabase, YOHR_ORG_ID, ACTIVE_ORG_IDS, STORAGE_PUBLIC_BASE, INGEST_ROWS_PER_TICK
+from .constants import supabase, YOHR_ORG_ID, ACTIVE_ORG_IDS, STORAGE_PUBLIC_BASE, INGEST_ROWS_PER_TICK, INGEST_PARALLEL
 
 logger = logging.getLogger(__name__)
 
@@ -265,12 +266,47 @@ def _row_update(row: dict, **fields) -> dict:
 
 def _upsert_rows(talent_records: list[dict], rows: list[dict],
                  row_id_map: dict[str, dict]) -> None:
-    """Bulk upsert with per-row fallback on failure."""
+    """
+    Upsert a tick's records in parallel chunks, each with its own per-row
+    fallback. hr_talent_pool runs 8 triggers and several GIN indexes per row
+    (~0.1 s/row server-side), so one 500-row statement took ~50 s; running
+    INGEST_PARALLEL chunks at once uses more of the database's capacity.
+    Records are de-duplicated by (email, org) BEFORE chunking, so no two
+    chunks touch the same talent-pool row (no lock contention / deadlocks).
+    """
     rows_by_id = {r["id"]: r for r in rows}
+    records = _dedupe_by_email(talent_records)
+    key = lambda rec: ((rec.get("email") or "").strip().lower(), rec.get("organization_id"))
+    rows_for_key: dict[tuple, list[str]] = {}
+    for row_id, rec in row_id_map.items():
+        rows_for_key.setdefault(key(rec), []).append(row_id)
+
+    n = max(1, min(INGEST_PARALLEL, len(records)))
+    size = -(-len(records) // n)
+    chunks = [records[i:i + size] for i in range(0, len(records), size)]
+
+    def run(chunk: list[dict]) -> None:
+        chunk_row_ids = {rid: row_id_map[rid] for rec in chunk for rid in rows_for_key.get(key(rec), [])}
+        _upsert_chunk(chunk, rows_by_id, chunk_row_ids)
+
+    if len(chunks) == 1:
+        run(chunks[0])
+        return
+    with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
+        for f in [pool.submit(run, c) for c in chunks]:
+            try:
+                f.result()
+            except Exception as exc:  # _upsert_chunk handles its own errors
+                logger.error("ingestor: chunk crashed: %s", exc)
+
+
+def _upsert_chunk(records: list[dict], rows_by_id: dict[str, dict],
+                  row_id_map: dict[str, dict]) -> None:
+    """Bulk upsert one chunk with per-row fallback on failure."""
     try:
         result = (
             supabase.table("hr_talent_pool")
-            .upsert(_dedupe_by_email(talent_records), on_conflict="email,organization_id")
+            .upsert(records, on_conflict="email,organization_id")
             .execute()
         )
         upserted     = result.data or []
