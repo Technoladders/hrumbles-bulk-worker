@@ -77,7 +77,7 @@ class TestIngestorBatching(unittest.TestCase):
     def test_500_rows_use_two_requests_not_500(self):
         fake = _Fake()
         rows, recs = _rows(500)
-        with patch.object(ingestor, "supabase", fake):
+        with patch.object(ingestor, "supabase", fake), patch.object(ingestor, "INGEST_PARALLEL", 1):
             ingestor._upsert_rows(list(recs.values()), rows, recs)
         kinds = [(t, k) for t, k, _, _ in fake.log]
         self.assertEqual(kinds, [("hr_talent_pool", "upsert"), ("org_csv_import_rows", "upsert")])
@@ -89,7 +89,7 @@ class TestIngestorBatching(unittest.TestCase):
     def test_duplicate_emails_are_merged_so_bulk_upsert_succeeds(self):
         fake = _Fake()
         rows, recs = _rows(10, dup_every=2)
-        with patch.object(ingestor, "supabase", fake):
+        with patch.object(ingestor, "supabase", fake), patch.object(ingestor, "INGEST_PARALLEL", 1):
             ingestor._upsert_rows(list(recs.values()), rows, recs)
         self.assertEqual([k for _, k, _, _ in fake.log], ["upsert", "upsert"])  # no fallback
         sent = fake.log[0][2]
@@ -99,6 +99,20 @@ class TestIngestorBatching(unittest.TestCase):
         status = fake.log[1][2]
         self.assertEqual(len(status), 10)
         self.assertTrue(all(u["talent_pool_id"] for u in status))
+
+    def test_parallel_chunks_are_disjoint_and_mark_every_row(self):
+        fake = _Fake()
+        rows, recs = _rows(500, dup_every=2)          # 250 people, 2 rows each
+        with patch.object(ingestor, "supabase", fake), patch.object(ingestor, "INGEST_PARALLEL", 4):
+            ingestor._upsert_rows(list(recs.values()), rows, recs)
+        talent = [p for t, k, p, _ in fake.log if t == "hr_talent_pool"]
+        status = [u for t, k, p, _ in fake.log if t == "org_csv_import_rows" for u in p]
+        self.assertEqual(len(talent), 4)                               # 4 parallel bulk upserts
+        emails = [r["email"].lower() for chunk in talent for r in chunk]
+        self.assertEqual(len(emails), 250)
+        self.assertEqual(len(emails), len(set(emails)))                # no email in two chunks
+        self.assertEqual(sorted(u["id"] for u in status), sorted(recs))  # every row marked once
+        self.assertTrue(all(u["s4_status"] == "done" and u["talent_pool_id"] for u in status))
 
 
 if __name__ == "__main__":

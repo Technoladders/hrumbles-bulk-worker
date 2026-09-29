@@ -58,6 +58,9 @@ MAX_RESUME_BYTES     = 4 * 1024 * 1024
 # ceiling again.
 DOWNLOAD_ROWS_PER_TICK = int(os.getenv("DOWNLOAD_ROWS_PER_TICK", "500"))
 INGEST_ROWS_PER_TICK   = int(os.getenv("INGEST_ROWS_PER_TICK", "500"))
+# Parallel talent-pool upserts per ingest tick (hr_talent_pool triggers +
+# GIN indexes make each row ~0.1 s server-side).
+INGEST_PARALLEL        = int(os.getenv("INGEST_PARALLEL", "4"))
 MAX_DOWNLOAD_RETRIES = 3
 DOWNLOAD_TIMEOUT     = 30
 # Hard wall-clock limit per resume: DOWNLOAD_TIMEOUT only bounds each socket
