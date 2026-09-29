@@ -185,10 +185,10 @@ class TestWorkerConcurrencyBounded(unittest.TestCase):
     def test_ai_workers_and_download_workers_are_reduced(self):
         from yohr import constants
         self.assertEqual(constants.MAX_AI_WORKERS, 2)
-        # Downloads were raised back to 8 once each one's memory was capped:
+        # Downloads were raised (8, then 24) once each one's memory was capped:
         # keep the thread count bounded and the per-resume cap in place so
         # S2's peak memory (workers x cap) stays well under the 512 MiB limit.
-        self.assertLessEqual(constants.MAX_DOWNLOAD_WORKERS, 8)
+        self.assertLessEqual(constants.MAX_DOWNLOAD_WORKERS, 32)
         self.assertLessEqual(constants.MAX_RESUME_BYTES, 10 * 1024 * 1024)
         self.assertLessEqual(constants.MAX_DOWNLOAD_WORKERS * constants.MAX_RESUME_BYTES, 128 * 1024 * 1024)
 
