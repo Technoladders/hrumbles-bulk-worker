@@ -86,5 +86,61 @@ class TestNonBlockingDownloader(unittest.TestCase):
             gate.set()
 
 
+class TestStatusUpdateSurvivesDroppedConnection(unittest.TestCase):
+    """A dropped Supabase connection must not strand a row in "downloading"."""
+
+    def _client(self, fail_times, calls):
+        class Q:
+            def update(s, payload):
+                calls.append(payload)
+                return s
+
+            def eq(s, *a):
+                return s
+
+            def execute(s):
+                if len(calls) <= fail_times:
+                    raise RuntimeError("Server disconnected")
+                return None
+
+        class C:
+            def table(s, name):
+                return Q()
+        return C()
+
+    def test_retries_on_fresh_client_then_succeeds(self):
+        calls, made = [], []
+
+        def factory(*a):
+            made.append(1)
+            return self._client(2, calls)
+
+        rd._thread_local.db = None
+        with patch.object(rd, "create_client", factory), patch.object(rd.time, "sleep", lambda s: None):
+            rd._set_row("r1", {"s2_status": "done"})
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(made), 3)  # a new client after each failure
+        rd._thread_local.db = None
+
+    def test_gives_up_after_tries(self):
+        calls = []
+        rd._thread_local.db = None
+        with patch.object(rd, "create_client", lambda *a: self._client(99, calls)), \
+             patch.object(rd.time, "sleep", lambda s: None):
+            with self.assertRaises(RuntimeError):
+                rd._set_row("r1", {"s2_status": "done"})
+        self.assertEqual(len(calls), 3)
+        rd._thread_local.db = None
+
+    def test_each_thread_gets_its_own_client(self):
+        made = []
+        rd._thread_local.db = None
+        with patch.object(rd, "create_client", lambda *a: made.append(object()) or made[-1]):
+            ids = []
+            ts = [threading.Thread(target=lambda: ids.append(id(rd._db()))) for _ in range(4)]
+            [t.start() for t in ts]
+            [t.join() for t in ts]
+        self.assertEqual(len(set(ids)), 4)
+
 if __name__ == "__main__":
     unittest.main()
