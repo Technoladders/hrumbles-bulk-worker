@@ -343,6 +343,15 @@ def _upsert_chunk(records: list[dict], rows_by_id: dict[str, dict],
 # Scheduler entry point
 # ---------------------------------------------------------------------------
 
+# s3 gate: a row is ready once AI is done or skipped, and also when AI has
+# given up on it -- it is then ingested from the CSV fields alone (ai_result
+# is empty), and Run AI / the backfill can still enrich it later. Rows whose
+# resume download failed never enter AI (ai_processor only takes s2
+# done/skipped), so they are ready with s3 still pending. Before this, both
+# kinds sat in s4 "pending" forever (7,253 rows found on 2026-10-01).
+S3_READY_FILTER = "s3_status.in.(done,skipped,failed),and(s2_status.eq.failed,s3_status.eq.pending)"
+
+
 def run_ingestor() -> None:
     try:
         # s2 gate: with AI disabled, s3 is 'skipped' from the start, so
@@ -361,7 +370,7 @@ def run_ingestor() -> None:
                 )
                 .in_("org_id", ACTIVE_ORG_IDS)
                 .in_("s2_status", ["done", "skipped", "failed"])
-                .in_("s3_status", ["done", "skipped"])
+                .or_(S3_READY_FILTER)
                 .eq("s4_status", "pending")
             ),
             limit=INGEST_ROWS_PER_TICK,
