@@ -17,6 +17,7 @@ from supabase import create_client
 
 from config import SUPABASE_URL, SUPABASE_SERVICE_KEY
 from .fair_share import fetch_fair_share
+from . import throttle
 from .constants import (
     supabase, ACTIVE_ORG_IDS, STORAGE_BUCKET, RESUME_PATH_PREFIX,
     MAX_DOWNLOAD_WORKERS, MAX_DOWNLOAD_RETRIES, DOWNLOAD_TIMEOUT,
@@ -24,6 +25,12 @@ from .constants import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Rows count as stuck after STUCK_MINUTES without an update. Checking every
+# STUCK_MINUTES / 2 bounds the extra wait to half the cutoff while running the
+# (full-table-scan) reset ~20x less often than the 15 s tick.
+STUCK_MINUTES = 10
+STUCK_RESET_INTERVAL_SECONDS = STUCK_MINUTES * 60 / 2
 
 
 def safe_filename(raw_name: str) -> str:
@@ -47,20 +54,21 @@ def run_downloader() -> None:
     # _download_row never actually sets (it sets "downloading") and that
     # isn't even in org_csv_import_rows' s2_status CHECK constraint — so this
     # reset never matched anything. Fixed to check the real in-progress value.
-    try:
-        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-        reset = (
-            supabase.table("org_csv_import_rows")
-            .update({"s2_status": "pending", "s2_error": "auto-reset: stuck in downloading"})
-            .in_("org_id", ACTIVE_ORG_IDS)
-            .eq("s2_status", "downloading")
-            .lt("updated_at", cutoff)
-            .execute()
-        )
-        if reset.data:
-            logger.info("downloader: reset %d stuck rows → pending", len(reset.data))
-    except Exception as exc:
-        logger.warning("downloader: stuck-row reset failed (non-fatal): %s", exc)
+    if throttle.due("s2_stuck_reset", STUCK_RESET_INTERVAL_SECONDS):
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(minutes=STUCK_MINUTES)).isoformat()
+            reset = (
+                supabase.table("org_csv_import_rows")
+                .update({"s2_status": "pending", "s2_error": "auto-reset: stuck in downloading"})
+                .in_("org_id", ACTIVE_ORG_IDS)
+                .eq("s2_status", "downloading")
+                .lt("updated_at", cutoff)
+                .execute()
+            )
+            if reset.data:
+                logger.info("downloader: reset %d stuck rows → pending", len(reset.data))
+        except Exception as exc:
+            logger.warning("downloader: stuck-row reset failed (non-fatal): %s", exc)
 
     try:
         rows = fetch_fair_share(
@@ -73,6 +81,7 @@ def run_downloader() -> None:
             ),
             limit=DOWNLOAD_ROWS_PER_TICK,
             exclude_ids=_in_flight,
+            stage="s2",
         )
     except Exception as exc:
         logger.error("downloader: failed to fetch rows: %s", exc)

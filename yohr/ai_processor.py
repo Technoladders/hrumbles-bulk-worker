@@ -25,6 +25,7 @@ from .constants import (
     MAX_AI_WORKERS, MAX_AI_RETRIES,
 )
 from .ai_budget import get_budget_status, record_usage
+from . import throttle
 
 logger = logging.getLogger(__name__)
 
@@ -330,22 +331,28 @@ def _process_row(row: dict) -> None:
 # Scheduler entry point
 # ---------------------------------------------------------------------------
 
+STUCK_MINUTES = 5
+# Half the cutoff, not every 20 s tick — see resume_downloader.STUCK_RESET_INTERVAL_SECONDS.
+STUCK_RESET_INTERVAL_SECONDS = STUCK_MINUTES * 60 / 2
+
+
 def run_ai_processor() -> None:
     # ── Reset rows stuck in "processing" for >5 min (handles worker restarts) ──
-    try:
-        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
-        reset = (
-            supabase.table("org_csv_import_rows")
-            .update({"s3_status": "pending", "s3_error": "auto-reset: stuck in processing"})
-            .in_("org_id", ACTIVE_ORG_IDS)
-            .eq("s3_status", "processing")
-            .lt("updated_at", cutoff)
-            .execute()
-        )
-        if reset.data:
-            logger.info("ai_processor: reset %d stuck rows → pending", len(reset.data))
-    except Exception as exc:
-        logger.warning("ai_processor: stuck-row reset failed (non-fatal): %s", exc)
+    if throttle.due("s3_stuck_reset", STUCK_RESET_INTERVAL_SECONDS):
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(minutes=STUCK_MINUTES)).isoformat()
+            reset = (
+                supabase.table("org_csv_import_rows")
+                .update({"s3_status": "pending", "s3_error": "auto-reset: stuck in processing"})
+                .in_("org_id", ACTIVE_ORG_IDS)
+                .eq("s3_status", "processing")
+                .lt("updated_at", cutoff)
+                .execute()
+            )
+            if reset.data:
+                logger.info("ai_processor: reset %d stuck rows → pending", len(reset.data))
+        except Exception as exc:
+            logger.warning("ai_processor: stuck-row reset failed (non-fatal): %s", exc)
 
     try:
         rows = (
