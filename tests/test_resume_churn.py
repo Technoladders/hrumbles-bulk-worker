@@ -193,6 +193,70 @@ class TestPollMarksDoneOnlyWhenStored(unittest.TestCase):
         self.assertEqual(self._status_ids(fake, "failed"), [])
 
 
+class _PgLikeFake(_Fake):
+    """Inserts into hr_resume_ai_results fail if ANY row in the payload is 'bad'
+    (like one invalid row aborting a multi-row INSERT) or contains a NUL char."""
+
+    def __init__(self, bad_ids=()):
+        super().__init__()
+        self.bad_ids, self.stored = set(bad_ids), []
+
+    def table(self, name):
+        op = super().table(name)
+        if name != "hr_resume_ai_results":
+            return op
+        fake = self
+
+        def insert(payload):
+            rows = payload if isinstance(payload, list) else [payload]
+            op._verb("insert", payload)
+
+            def execute():
+                for r in rows:
+                    if r["resume_file_id"] in fake.bad_ids or "\x00" in json.dumps(r, ensure_ascii=False):
+                        raise RuntimeError("22P05 unsupported Unicode escape sequence / invalid row")
+                fake.stored.extend(r["resume_file_id"] for r in rows)
+
+                class R:
+                    data = []
+                return R()
+            op.execute = execute
+            return op
+        op.insert = insert
+        return op
+
+
+def _uuid(n):
+    return f"{n:08x}-0000-0000-0000-000000000000"
+
+
+class TestOneBadRowDoesNotSinkItsChunk(unittest.TestCase):
+    def _poll(self, fake, lines):
+        job = {"id": "job-1", "openai_batch_id": "batch-1", "organization_id": "org-1",
+               "updated_at": datetime.now(timezone.utc).isoformat()}
+        with patch.object(bulk_tasks, "supabase", fake), \
+             patch.object(bulk_tasks, "openai_client", _OAI(lines)):
+            bulk_tasks._check_one_batch(job)
+
+    def test_only_the_bad_row_fails(self):
+        ids = [_uuid(i) for i in range(60)]                  # chunks of 50 + 10
+        bad = ids[7]
+        fake = _PgLikeFake(bad_ids={bad})
+        self._poll(fake, [_line(i) for i in ids])
+        done = TestPollMarksDoneOnlyWhenStored._status_ids(fake, "done")
+        failed = TestPollMarksDoneOnlyWhenStored._status_ids(fake, "failed")
+        self.assertEqual(len(done), 59)
+        self.assertEqual(failed, [bad])
+        self.assertCountEqual(fake.stored, [i for i in ids if i != bad])
+
+    def test_nul_characters_are_stripped_not_fatal(self):
+        fid = _uuid(1)
+        fake = _PgLikeFake()
+        self._poll(fake, [_line(fid, content={"email": "a@b.com", "summary": "x\x00y"})])
+        self.assertEqual(fake.stored, [fid])
+        self.assertEqual(TestPollMarksDoneOnlyWhenStored._status_ids(fake, "done"), [fid])
+
+
 class TestSubmitAfterBatchCreated(unittest.TestCase):
     def _oai(self):
         class O:

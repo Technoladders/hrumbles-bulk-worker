@@ -439,13 +439,14 @@ def _check_one_batch(job: Dict) -> str:
                     failed_ids.append(file_id)
                     continue
 
+                profile = _strip_nul(profile)     # jsonb rejects \u0000
                 email = (profile.get('email') or '').lower().strip()
                 ai_inserts.append({
                     'resume_file_id':    file_id,
                     'batch_job_id':      batch_job_id,
                     'organization_id':   org_id,
                     'openai_custom_id':  custom_id,
-                    'raw_response':      parsed,
+                    'raw_response':      _strip_nul(parsed),
                     'extracted_profile': profile,
                     'candidate_email':   email or None,
                     'input_tokens':      usage.get('prompt_tokens', 0),
@@ -470,20 +471,19 @@ def _check_one_batch(job: Dict) -> str:
                 supabase.table('hr_resume_ai_results').insert(chunk).execute()
                 stored_ids.update(r['resume_file_id'] for r in chunk)
             except Exception as e:
-                err_str = str(e).lower()
-                if 'duplicate' in err_str or '23505' in err_str:
-                    logger.info(f'[Poll] Chunk {i//50+1} duplicates, inserting row-by-row')
-                    for row in chunk:
-                        try:
-                            supabase.table('hr_resume_ai_results').insert(row).execute()
-                            stored_ids.add(row['resume_file_id'])
-                        except Exception as re:
-                            if 'duplicate' in str(re).lower() or '23505' in str(re):
-                                stored_ids.add(row['resume_file_id'])  # already present = ok
-                            else:
-                                logger.error(f'[Poll] Row insert failed {row["resume_file_id"]}: {re}')
-                else:
-                    logger.error(f'[Poll] Chunk {i//50+1} insert failed: {e}', exc_info=True)
+                # Any chunk failure (duplicate or not) falls back to row-by-row,
+                # so one bad row fails alone instead of discarding the other 49
+                # results — production lost whole 50-row chunks this way.
+                logger.warning(f'[Poll] Chunk {i//50+1} insert failed ({str(e)[:200]}); inserting row-by-row')
+                for row in chunk:
+                    try:
+                        supabase.table('hr_resume_ai_results').insert(row).execute()
+                        stored_ids.add(row['resume_file_id'])
+                    except Exception as re:
+                        if 'duplicate' in str(re).lower() or '23505' in str(re):
+                            stored_ids.add(row['resume_file_id'])  # already present = ok
+                        else:
+                            logger.error(f'[Poll] Row insert failed {row["resume_file_id"]}: {re}')
 
         logger.info(f'[Poll] Inserted {len(stored_ids)} ai_result rows')
 
@@ -767,6 +767,17 @@ def _sanitize(val):
     if isinstance(val, str):
         return val.replace('\x00', '')
     return val
+
+def _strip_nul(obj):
+    """Recursively drop NUL characters from strings (PostgreSQL text/jsonb reject
+    \\u0000, which fails the whole insert)."""
+    if isinstance(obj, str):
+        return obj.replace('\x00', '')
+    if isinstance(obj, dict):
+        return {_strip_nul(k): _strip_nul(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_strip_nul(v) for v in obj]
+    return obj
 
 def _update_file(file_id: str, data: Dict) -> bool:
     """Returns False if the write failed. A lost write leaves the row in
