@@ -365,6 +365,7 @@ def run_ingestor() -> None:
                 .eq("s4_status", "pending")
             ),
             limit=INGEST_ROWS_PER_TICK,
+            stage="s4",
         )
     except Exception as exc:
         logger.error("ingestor: fetch failed: %s", exc)
