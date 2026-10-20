@@ -22,6 +22,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 from config import supabase, bulk_queue, PORT
+from bulk_maintenance import sweep_exhausted_files
 from yohr.scheduler import register_yohr_jobs
 
 app    = Flask(__name__)
@@ -47,12 +48,13 @@ def _on_error(event):
 def _on_missed(event):
     logger.warning(f'[Scheduler] Job missed: {event.job_id}')
 
-def _reset_stuck():
-    try:
-        supabase.rpc('force_reset_stuck_bulk_files', {}).execute()
-        logger.info('[Scheduler] reset_stuck_bulk_files OK')
-    except Exception as e:
-        logger.error(f'[Scheduler] reset_stuck_bulk_files failed: {e}')
+def _sweep_exhausted():
+    # Was force_reset_stuck_bulk_files(): it zeroed parse/ingest attempts on
+    # every 'parsing'/'ingesting' row every 15 min, so rows the claims could
+    # never finish retried forever (~600k updates/day). The claims already
+    # re-claim stale rows; this only retires rows that used all their attempts.
+    # See bulk_maintenance.py.
+    sweep_exhausted_files()
 
 scheduler = BackgroundScheduler(timezone='UTC')
 scheduler.add_listener(_on_error,  EVENT_JOB_ERROR)
@@ -64,10 +66,10 @@ scheduler.add_job(lambda: _enqueue('poll_ai_batches',         600), 'interval', 
 scheduler.add_job(lambda: _enqueue('ingest_candidates_batch', 600), 'interval', seconds=15,  id='ingest',  max_instances=1, coalesce=True, misfire_grace_time=15)
 
 scheduler.add_job(
-    _reset_stuck,
+    _sweep_exhausted,
     'interval',
     minutes=15,
-    id='reset_stuck',
+    id='sweep_exhausted',
     max_instances=1,
     coalesce=True,
     misfire_grace_time=60

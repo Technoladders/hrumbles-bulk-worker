@@ -262,18 +262,6 @@ def _submit_org_batch(org_id: str, files: List[Dict]) -> int:
             },
         )
         logger.info(f'[Submit] OAI batch created: {batch.id}')
-
-        supabase.table('hr_resume_batch_jobs').update({
-            'openai_batch_id': batch.id, 'openai_file_id': oai_file.id,
-            'status': 'processing', 'updated_at': _now(),
-        }).eq('id', batch_job_id).execute()
-
-        supabase.table('hr_resume_files').update({
-            'ai_status': 'queued', 'ai_batch_job_id': batch_job_id, 'ai_queued_at': _now(),
-        }).in_('id', file_ids).execute()
-
-        return len(files)
-
     except Exception as e:
         supabase.table('hr_resume_batch_jobs').update({
             'status': 'failed', 'error_message': str(e)[:500], 'updated_at': _now(),
@@ -283,6 +271,27 @@ def _submit_org_batch(org_id: str, files: List[Dict]) -> int:
         }).in_('id', file_ids).execute()
         logger.error(f'[Submit] Org {org_id[:8]} batch failed: {e}')
         raise
+
+    # The OpenAI batch now exists (and is billed). Never fall back to marking
+    # the job failed / files pending from here: poll only reads 'processing'
+    # jobs, so that would discard paid results and resubmit the same files.
+    # Retry the bookkeeping once; if it still fails, leave state as-is and raise.
+    for attempt in (1, 2):
+        try:
+            supabase.table('hr_resume_batch_jobs').update({
+                'openai_batch_id': batch.id, 'openai_file_id': oai_file.id,
+                'status': 'processing', 'updated_at': _now(),
+            }).eq('id', batch_job_id).execute()
+            supabase.table('hr_resume_files').update({
+                'ai_status': 'queued', 'ai_batch_job_id': batch_job_id, 'ai_queued_at': _now(),
+            }).in_('id', file_ids).execute()
+            return len(files)
+        except Exception as e:
+            if attempt == 2:
+                logger.critical(f'[Submit] Org {org_id[:8]}: OAI batch {batch.id} created but '
+                                f'job {batch_job_id[:8]} could not be recorded: {e}')
+                raise
+            logger.warning(f'[Submit] Org {org_id[:8]}: recording batch {batch.id} failed, retrying: {e}')
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -450,12 +459,16 @@ def _check_one_batch(job: Dict) -> str:
 
         logger.info(f'[Poll] Parsed: {len(success_ids)} ok, {len(failed_ids)} failed')
 
-        inserted_count = 0
+        # Only files whose hr_resume_ai_results row exists may become
+        # ai_status='done': claim_ingest_batch INNER JOINs that table, so a
+        # 'done' file without a result is claimed every tick but never returned
+        # (it used to cycle forever via the 15-min attempt reset).
+        stored_ids: set = set()
         for i in range(0, len(ai_inserts), 50):
             chunk = ai_inserts[i:i+50]
             try:
                 supabase.table('hr_resume_ai_results').insert(chunk).execute()
-                inserted_count += len(chunk)
+                stored_ids.update(r['resume_file_id'] for r in chunk)
             except Exception as e:
                 err_str = str(e).lower()
                 if 'duplicate' in err_str or '23505' in err_str:
@@ -463,16 +476,22 @@ def _check_one_batch(job: Dict) -> str:
                     for row in chunk:
                         try:
                             supabase.table('hr_resume_ai_results').insert(row).execute()
-                            inserted_count += 1
+                            stored_ids.add(row['resume_file_id'])
                         except Exception as re:
                             if 'duplicate' in str(re).lower() or '23505' in str(re):
-                                inserted_count += 1  # already present = ok
+                                stored_ids.add(row['resume_file_id'])  # already present = ok
                             else:
                                 logger.error(f'[Poll] Row insert failed {row["resume_file_id"]}: {re}')
                 else:
                     logger.error(f'[Poll] Chunk {i//50+1} insert failed: {e}', exc_info=True)
 
-        logger.info(f'[Poll] Inserted {inserted_count} ai_result rows')
+        logger.info(f'[Poll] Inserted {len(stored_ids)} ai_result rows')
+
+        not_stored = [fid for fid in success_ids if fid not in stored_ids]
+        if not_stored:
+            logger.error(f'[Poll] {len(not_stored)} parsed results could not be stored; marking ai_status=failed')
+            failed_ids.extend(not_stored)
+        success_ids = [fid for fid in success_ids if fid in stored_ids]
 
         if success_ids:
             supabase.table('hr_resume_files').update({
@@ -749,12 +768,17 @@ def _sanitize(val):
         return val.replace('\x00', '')
     return val
 
-def _update_file(file_id: str, data: Dict) -> None:
+def _update_file(file_id: str, data: Dict) -> bool:
+    """Returns False if the write failed. A lost write leaves the row in
+    'parsing'/'ingesting'; the claims re-claim it after 10 min (up to 3
+    attempts) and bulk_maintenance.sweep_exhausted_files retires it after that."""
     try:
         clean = {k: _sanitize(v) for k, v in data.items()}
         supabase.table('hr_resume_files').update(clean).eq('id', file_id).execute()
+        return True
     except Exception as e:
-        logger.error(f'[DB] update hr_resume_files {file_id}: {e}')
+        logger.error(f'[DB] update hr_resume_files {file_id} failed (row left for stale re-claim): {e}')
+        return False
 
 def _log_ingest(file_id, ai_result_id, org_id, email, action, reason,
                 candidate_id=None, field_changes=None, error=None):
