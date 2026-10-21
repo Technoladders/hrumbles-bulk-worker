@@ -201,23 +201,13 @@ def _build_talent_record(row: dict, created_by: Optional[str] = None) -> tuple[O
     return record, skills
 
 
-# ---------------------------------------------------------------------------
-# Skills master sync
-# ---------------------------------------------------------------------------
-
-def _sync_skills_master(skills: set[str]) -> None:
-    if not skills:
-        return
-    try:
-        records = [
-            {"name": s, "name_lower": s.lower(), "source": "yohr_csv"}
-            for s in skills
-        ]
-        supabase.table("skills_master").upsert(
-            records, on_conflict="name_lower", ignore_duplicates=True
-        ).execute()
-    except Exception as exc:
-        logger.warning("ingestor: skills_master sync failed: %s", exc)
+# skills_master is filled by the database, not here: the hr_talent_pool
+# trigger trg_add_skills_from_talent_pool (AFTER INSERT OR UPDATE OF
+# top_skills) inserts (skill_name, organization_id) ... ON CONFLICT DO NOTHING
+# for every talent record _upsert_rows writes. The worker's own upsert used
+# columns skills_master doesn't have (name / name_lower / source; the table is
+# skill_name + organization_id NOT NULL, unique on both) and failed with
+# PGRST204 on every batch without ever inserting a row.
 
 
 # ---------------------------------------------------------------------------
@@ -394,22 +384,20 @@ def run_ingestor() -> None:
 
     talent_records: list[dict] = []
     row_id_map:     dict       = {}
-    all_skills:     set[str]   = set()
 
     for row in rows:
         created_by = session_created_by.get(row["session_id"])
         # org_id is only selected for the s4 status write-back; leave the
         # record's organization resolution exactly as before.
         build_input = {k: v for k, v in row.items() if k != "org_id"}
-        record, skills = _build_talent_record(build_input, created_by=created_by)
+        record, _skills = _build_talent_record(build_input, created_by=created_by)
         if record:
             talent_records.append(record)
             row_id_map[row["id"]] = record
-            all_skills.update(skills)
 
     if talent_records:
+        # skills_master is synced by the hr_talent_pool trigger (see above).
         _upsert_rows(talent_records, rows, row_id_map)
-        _sync_skills_master(all_skills)
 
     session_ids = {r["session_id"] for r in rows}
     for sid in session_ids:
