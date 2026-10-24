@@ -33,7 +33,7 @@ RESUME_PATH_PREFIX = "yohr-csv"
 # yohr/csv_parser.py's _process_session and the s1_complete column.
 MAX_CSV_ROWS_PER_TICK = 20_000
 
-OPENAI_MODEL       = "gpt-4.1-nano"
+OPENAI_MODEL       = "gpt-6-luna"
 
 # Enough for full structured extraction (work_exp + education + projects + certs)
 MAX_AI_TOKENS      = 4096

@@ -228,8 +228,7 @@ def _call_ai_raw(full_text: str, client) -> tuple[dict, int]:
 
     response = client.chat.completions.create(
         model=OPENAI_MODEL,
-        max_tokens=MAX_AI_TOKENS,
-        temperature=0,
+        max_completion_tokens=MAX_AI_TOKENS,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": ai_input},
