@@ -1,5 +1,6 @@
 import os
 import logging
+import httpx
 from supabase import create_client, Client
 from openai import OpenAI
 from redis import Redis
@@ -51,7 +52,45 @@ PORT                = int(os.getenv('PORT', 5010))
 BULK_QUEUE_NAME     = 'bulk-pipeline'
 
 # ── Clients (module-level singletons) ────────────────────────────────────────
+class _RetryReadsOnDisconnect(httpx.BaseTransport):
+    """
+    Retries a GET/HEAD once when the server drops the connection mid-request.
+
+    Every YOHR stage shares this one supabase client, whose PostgREST session
+    multiplexes all requests over a single HTTP/2 connection. When Supabase
+    closes that connection (idle close / GOAWAY), every in-flight request
+    fails at once with httpx.RemoteProtocolError("Server disconnected") — ~50
+    ERROR lines/day — while the next tick succeeds. httpcore has already
+    marked the dead connection unusable, so one immediate retry opens a fresh
+    one. Only reads are retried: a POST/PATCH/DELETE (insert, update, rpc
+    claim_*) may already have been applied server-side, so it still raises.
+    """
+
+    _RETRY_METHODS = ("GET", "HEAD")
+
+    def __init__(self, transport: httpx.BaseTransport) -> None:
+        self._transport = transport
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        try:
+            return self._transport.handle_request(request)
+        except httpx.RemoteProtocolError as exc:
+            if request.method not in self._RETRY_METHODS:
+                raise
+            logging.getLogger(__name__).warning(
+                "supabase: %s %s disconnected (%s), retrying once",
+                request.method, request.url.path, exc,
+            )
+            return self._transport.handle_request(request)
+
+    def close(self) -> None:
+        self._transport.close()
+
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+# Wrap (not replace) the existing transport so http2/limits/verify are kept.
+# Service-role client never signs in, so supabase-py never rebuilds postgrest.
+supabase.postgrest.session._transport = _RetryReadsOnDisconnect(supabase.postgrest.session._transport)
 openai_client    = OpenAI(api_key=OPENAI_API_KEY)
 yohr_ai_client   = OpenAI(api_key=YOHR_OPENAI_API_KEY or OPENAI_API_KEY)  # falls back only when YOHR_ALLOW_SHARED_KEY=true (checked above)
 redis_conn       = Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=False)
