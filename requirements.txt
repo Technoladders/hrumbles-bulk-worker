@@ -14,3 +14,4 @@ tenacity==8.5.0
 phonenumbers==8.13.43
 pycountry==24.6.1
 country_converter==1.2
+pandas==2.2.3
