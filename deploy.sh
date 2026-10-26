@@ -48,6 +48,7 @@ docker run -d \
   --network "$NETWORK" \
   --restart unless-stopped \
   --env-file "$APP_DIR/.env" \
+  -v "$APP_DIR/intake-data:/data" \
   --memory 512m \
   --memory-swap 768m \
   --cpus 1.0 \

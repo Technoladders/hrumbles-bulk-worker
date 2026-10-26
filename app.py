@@ -24,6 +24,7 @@ from flask_cors import CORS
 from config import supabase, bulk_queue, PORT
 from bulk_maintenance import sweep_exhausted_files
 from yohr.scheduler import register_yohr_jobs
+from mail_intake import register_mail_intake
 
 app    = Flask(__name__)
 CORS(app, resources={r'/api/*': {'origins': '*'}})
@@ -76,6 +77,7 @@ scheduler.add_job(
 )
 
 register_yohr_jobs(scheduler)
+register_mail_intake(app, scheduler)
 
 scheduler.start()
 logger.info('[Scheduler] Started: parse/10s, submit/5m, poll/10m, ingest/15s')
